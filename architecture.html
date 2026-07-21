@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>evidencia_pipe — Architecture Diagram</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: 'JetBrains Mono', monospace;
+      background: #020617;
+      min-height: 100vh;
+      padding: 2rem;
+      color: white;
+    }
+    
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    
+    .header {
+      margin-bottom: 2rem;
+    }
+    
+    .header-row {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 0.5rem;
+    }
+    
+    .pulse-dot {
+      width: 12px;
+      height: 12px;
+      background: #34d399;
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+    }
+    
+    .subtitle {
+      color: #94a3b8;
+      font-size: 0.875rem;
+      margin-left: 1.75rem;
+    }
+    
+    .diagram-container {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 1rem;
+      border: 1px solid #1e293b;
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+    
+    svg {
+      width: 100%;
+      min-width: 1000px;
+      display: block;
+    }
+    
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+      margin-top: 2rem;
+    }
+    
+    .card {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 0.75rem;
+      border: 1px solid #1e293b;
+      padding: 1.25rem;
+    }
+    
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+    
+    .card-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+    
+    .card-dot.cyan { background: #22d3ee; }
+    .card-dot.emerald { background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.amber { background: #fbbf24; }
+    .card-dot.rose { background: #fb7185; }
+    .card-dot.orange { background: #fb923c; }
+    
+    .card h3 {
+      font-size: 0.875rem;
+      font-weight: 600;
+    }
+    
+    .card ul {
+      list-style: none;
+      color: #94a3b8;
+      font-size: 0.75rem;
+    }
+    
+    .card li {
+      margin-bottom: 0.375rem;
+    }
+    
+    .footer {
+      text-align: center;
+      margin-top: 1.5rem;
+      color: #475569;
+      font-size: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>evidencia_pipe — Architecture</h1>
+      </div>
+      <p class="subtitle">Pipeline de ingestão DSpace → MinerU → Qdrant → LLM · FastAPI :8020 · Celery · GPU Worker</p>
+    </div>
+
+    <!-- Main Diagram -->
+    <div class="diagram-container">
+      <svg viewBox="0 0 1100 820">
+        <!-- Definitions -->
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#64748b" />
+          </marker>
+          <marker id="arrowhead-emerald" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#34d399" />
+          </marker>
+          <marker id="arrowhead-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee" />
+          </marker>
+          <marker id="arrowhead-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa" />
+          </marker>
+          <marker id="arrowhead-orange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#fb923c" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <!-- Background Grid -->
+        <rect width="100%" height="100%" fill="url(#grid)" />
+
+        <!-- =================================================================
+             BOUNDARIES / ZONES
+             ================================================================= -->
+
+        <!-- Physical / Server boundary -->
+        <rect x="20" y="30" width="1060" height="770" rx="12" fill="rgba(30, 41, 59, 0.08)" stroke="#475569" stroke-width="1.5" stroke-dasharray="8,4"/>
+        <text x="32" y="50" fill="#64748b" font-size="10" font-weight="600">GPU Server · Ubuntu · Tailscale</text>
+
+        <!-- Docker zone -->
+        <rect x="480" y="90" width="280" height="280" rx="10" fill="rgba(251, 146, 60, 0.04)" stroke="#fb923c" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="492" y="108" fill="#fb923c" font-size="9" font-weight="600">Docker Compose · Orchestration</text>
+
+        <!-- Host workers zone -->
+        <rect x="480" y="440" width="580" height="340" rx="10" fill="rgba(34, 211, 238, 0.04)" stroke="#22d3ee" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="492" y="458" fill="#22d3ee" font-size="9" font-weight="600">Host Workers · uv run Celery · GPU/Bge-M3</text>
+
+        <!-- =================================================================
+             EXTERNAL SERVICES (left column)
+             ================================================================= -->
+
+        <!-- DSpace RDApp -->
+        <g>
+          <rect x="40" y="120" width="160" height="70" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="120" y="145" fill="white" font-size="11" font-weight="600" text-anchor="middle">DSpace RDApp</text>
+          <text x="120" y="161" fill="#94a3b8" font-size="9" text-anchor="middle">REST API · Bitstreams</text>
+          <text x="120" y="175" fill="#94a3b8" font-size="8" text-anchor="middle">rdapp.comais.uft.edu.br</text>
+        </g>
+
+        <!-- DeepSeek API -->
+        <g>
+          <rect x="40" y="230" width="160" height="70" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="120" y="255" fill="white" font-size="11" font-weight="600" text-anchor="middle">DeepSeek API</text>
+          <text x="120" y="271" fill="#94a3b8" font-size="9" text-anchor="middle">Enrichment LLM</text>
+          <text x="120" y="285" fill="#fb7185" font-size="8" text-anchor="middle">Best-effort stage</text>
+        </g>
+
+        <!-- MinerU API (external GPU service) -->
+        <g>
+          <rect x="40" y="340" width="160" height="70" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+          <text x="120" y="365" fill="white" font-size="11" font-weight="600" text-anchor="middle">MinerU API</text>
+          <text x="120" y="381" fill="#94a3b8" font-size="9" text-anchor="middle">PDF Extraction</text>
+          <text x="120" y="395" fill="#94a3b8" font-size="8" text-anchor="middle">:8010 · GPU</text>
+        </g>
+
+        <!-- =================================================================
+             API LAYER (FastAPI)
+             ================================================================= -->
+
+        <!-- FastAPI Backend -->
+        <g>
+          <rect x="270" y="120" width="170" height="90" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+          <text x="355" y="145" fill="white" font-size="11" font-weight="600" text-anchor="middle">FastAPI</text>
+          <text x="355" y="161" fill="#94a3b8" font-size="9" text-anchor="middle">evidencia_pipe · :8020</text>
+          <text x="355" y="175" fill="#94a3b8" font-size="8" text-anchor="middle">POST /dspace/item/{uuid}</text>
+          <text x="355" y="189" fill="#94a3b8" font-size="8" text-anchor="middle">GET /status/{id} · /result/{id}</text>
+        </g>
+
+        <!-- Endpoints detail -->
+        <g>
+          <rect x="270" y="240" width="170" height="100" rx="6" fill="rgba(6, 78, 59, 0.25)" stroke="#34d399" stroke-width="1" stroke-dasharray="3,3"/>
+          <text x="355" y="258" fill="#34d399" font-size="8" font-weight="600" text-anchor="middle">BackgroundTasks</text>
+          <text x="355" y="274" fill="#94a3b8" font-size="8" text-anchor="middle">Response: 202 Accepted</text>
+          <text x="355" y="290" fill="#94a3b8" font-size="8" text-anchor="middle">Enfileira chain Celery</text>
+          <text x="355" y="306" fill="#94a3b8" font-size="8" text-anchor="middle">Job ID por PDF</text>
+          <text x="355" y="322" fill="#22d3ee" font-size="7" text-anchor="middle">/output/  static mount</text>
+        </g>
+
+        <!-- =================================================================
+             MESSAGE BROKER (Redis inside Docker)
+             ================================================================= -->
+
+        <!-- Redis -->
+        <g>
+          <rect x="510" y="130" width="140" height="70" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
+          <text x="580" y="155" fill="white" font-size="11" font-weight="600" text-anchor="middle">Redis</text>
+          <text x="580" y="171" fill="#94a3b8" font-size="9" text-anchor="middle">Celery Broker</text>
+          <text x="580" y="185" fill="#94a3b8" font-size="8" text-anchor="middle">DB 0 · :6379</text>
+        </g>
+
+        <!-- Job Store (Redis DB 1) -->
+        <g>
+          <rect x="510" y="240" width="140" height="80" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+          <text x="580" y="263" fill="white" font-size="11" font-weight="600" text-anchor="middle">Redis · DB 1</text>
+          <text x="580" y="279" fill="#94a3b8" font-size="9" text-anchor="middle">Job Store</text>
+          <text x="580" y="295" fill="#94a3b8" font-size="8" text-anchor="middle">Status · TTL 7d</text>
+        </g>
+
+        <!-- Flower -->
+        <g>
+          <rect x="510" y="355" width="140" height="60" rx="6" fill="rgba(251, 191, 36, 0.25)" stroke="#fbbf24" stroke-width="1.5"/>
+          <text x="580" y="377" fill="white" font-size="11" font-weight="600" text-anchor="middle">Flower</text>
+          <text x="580" y="393" fill="#94a3b8" font-size="9" text-anchor="middle">Monitor · :5555</text>
+        </g>
+
+        <!-- =================================================================
+             CELERY PIPELINE CHAIN (4 stages, right side)
+             ================================================================= -->
+
+        <!-- Stage labels -->
+        <text x="720" y="110" fill="#94a3b8" font-size="10" font-weight="600">Pipeline Chain (por PDF)</text>
+
+        <!-- Stage 1: Download -->
+        <g>
+          <rect x="720" y="130" width="180" height="65" rx="6" fill="rgba(136, 19, 55, 0.25)" stroke="#fb7185" stroke-width="1.5"/>
+          <text x="810" y="150" fill="#fb7185" font-size="10" font-weight="600" text-anchor="middle">① baixar_dspace</text>
+          <text x="810" y="165" fill="#94a3b8" font-size="8" text-anchor="middle">Fila: download</text>
+          <text x="810" y="180" fill="#94a3b8" font-size="8" text-anchor="middle">Download bitstream PDF</text>
+        </g>
+
+        <!-- Stage 2: MinerU -->
+        <g>
+          <rect x="720" y="225" width="180" height="65" rx="6" fill="rgba(136, 19, 55, 0.25)" stroke="#fb7185" stroke-width="1.5"/>
+          <text x="810" y="245" fill="#fb7185" font-size="10" font-weight="600" text-anchor="middle">② extrair_mineru</text>
+          <text x="810" y="260" fill="#94a3b8" font-size="8" text-anchor="middle">Fila: extract</text>
+          <text x="810" y="275" fill="#94a3b8" font-size="8" text-anchor="middle">PDF → Markdown + JSON</text>
+        </g>
+
+        <!-- Stage 3: LLM Enrich -->
+        <g>
+          <rect x="720" y="320" width="180" height="65" rx="6" fill="rgba(136, 19, 55, 0.25)" stroke="#fb7185" stroke-width="1.5"/>
+          <text x="810" y="340" fill="#fb7185" font-size="10" font-weight="600" text-anchor="middle">③ enrich_llm</text>
+          <text x="810" y="355" fill="#94a3b8" font-size="8" text-anchor="middle">Fila: llm</text>
+          <text x="810" y="370" fill="#94a3b8" font-size="8" text-anchor="middle">Metadados DeepSeek</text>
+        </g>
+
+        <!-- Stage 4: Index -->
+        <g>
+          <rect x="720" y="415" width="180" height="65" rx="6" fill="rgba(136, 19, 55, 0.25)" stroke="#fb7185" stroke-width="1.5"/>
+          <text x="810" y="435" fill="#fb7185" font-size="10" font-weight="600" text-anchor="middle">④ indexar_qdrant</text>
+          <text x="810" y="450" fill="#94a3b8" font-size="8" text-anchor="middle">Fila: gpu · concurrency=1</text>
+          <text x="810" y="465" fill="#94a3b8" font-size="8" text-anchor="middle">Embed + Upsert Qdrant</text>
+        </g>
+
+        <!-- =================================================================
+             WORKERS (right column, bottom)
+             ================================================================= -->
+
+        <!-- Worker light -->
+        <g>
+          <rect x="720" y="520" width="320" height="80" rx="8" fill="rgba(8, 51, 68, 0.3)" stroke="#22d3ee" stroke-width="1.5"/>
+          <text x="880" y="543" fill="white" font-size="11" font-weight="600" text-anchor="middle">Worker Light</text>
+          <text x="880" y="558" fill="#94a3b8" font-size="9" text-anchor="middle">celery -Q download,extract,llm -c 4</text>
+          <text x="880" y="573" fill="#94a3b8" font-size="8" text-anchor="middle">I/O bound · concorrência 4</text>
+          <text x="880" y="588" fill="#22d3ee" font-size="7" text-anchor="middle">Processa stages 1-3 em paralelo leve</text>
+        </g>
+
+        <!-- Worker GPU -->
+        <g>
+          <rect x="720" y="625" width="320" height="80" rx="8" fill="rgba(251, 146, 60, 0.2)" stroke="#fb923c" stroke-width="1.5"/>
+          <text x="880" y="648" fill="white" font-size="11" font-weight="600" text-anchor="middle">Worker GPU</text>
+          <text x="880" y="663" fill="#94a3b8" font-size="9" text-anchor="middle">WORKER_ROLE=gpu · -Q gpu · -c 1</text>
+          <text x="880" y="678" fill="#94a3b8" font-size="8" text-anchor="middle">GPU-bound · bge-m3 na VRAM</text>
+          <text x="880" y="693" fill="#fb923c" font-size="7" text-anchor="middle">⚠️ concurrency > 1 → OOM de VRAM</text>
+        </g>
+
+        <!-- =================================================================
+             DATA STORE (Qdrant)
+             ================================================================= -->
+
+        <!-- Qdrant Server -->
+        <g>
+          <rect x="720" y="740" width="180" height="55" rx="6" fill="rgba(76, 29, 149, 0.45)" stroke="#a78bfa" stroke-width="1.5"/>
+          <text x="810" y="760" fill="white" font-size="11" font-weight="600" text-anchor="middle">Qdrant</text>
+          <text x="810" y="776" fill="#94a3b8" font-size="9" text-anchor="middle">192.168.105.8:6333</text>
+        </g>
+
+        <!-- =================================================================
+             CHUNKING MODULE (center)
+             ================================================================= -->
+
+        <!-- Chunker + Embedder -->
+        <g>
+          <rect x="270" y="400" width="170" height="95" rx="6" fill="rgba(76, 29, 149, 0.2)" stroke="#a78bfa" stroke-width="1" stroke-dasharray="2,2"/>
+          <text x="355" y="420" fill="#a78bfa" font-size="9" font-weight="600" text-anchor="middle">Chunking Pipeline</text>
+          <text x="355" y="436" fill="#94a3b8" font-size="7" text-anchor="middle">MinerUChunker</text>
+          <text x="355" y="450" fill="#94a3b8" font-size="7" text-anchor="middle">Quality Filters (5 regras)</text>
+          <text x="355" y="464" fill="#94a3b8" font-size="7" text-anchor="middle">bge-m3 dense + sparse</text>
+          <text x="355" y="478" fill="#94a3b8" font-size="7" text-anchor="middle">max 1200 chars · overlap 250</text>
+        </g>
+
+        <!-- =================================================================
+             ARROWS / CONNECTIONS
+             ================================================================= -->
+
+        <!-- DSpace → FastAPI -->
+        <line x1="200" y1="155" x2="268" y2="155" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrowhead-emerald)"/>
+        <text x="234" y="148" fill="#94a3b8" font-size="8" text-anchor="middle">HTTPS</text>
+
+        <!-- FastAPI → Redis (enqueue) -->
+        <line x1="440" y1="145" x2="508" y2="155" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrowhead-orange)"/>
+        <text x="470" y="140" fill="#94a3b8" font-size="7" text-anchor="middle">enqueue</text>
+
+        <!-- FastAPI → Redis Job Store (status) -->
+        <line x1="355" y1="240" x2="355" y2="290" stroke="#a78bfa" stroke-width="1" marker-end="url(#arrowhead-violet)"/>
+
+        <!-- Redis → Flower -->
+        <line x1="580" y1="200" x2="580" y2="353" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrowhead)"/>
+
+        <!-- Redis Broker → Worker Light -->
+        <line x1="650" y1="200" x2="718" y2="560" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrowhead-cyan)"/>
+        <text x="678" y="375" fill="#94a3b8" font-size="7">consume</text>
+
+        <!-- Redis Broker → Worker GPU -->
+        <line x1="650" y1="200" x2="718" y2="665" stroke="#fb923c" stroke-width="1.5" marker-end="url(#arrowhead-orange)"/>
+        <text x="678" y="435" fill="#94a3b8" font-size="7">consume</text>
+
+        <!-- Chain connections between stages -->
+        <line x1="810" y1="195" x2="810" y2="223" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <text x="825" y="212" fill="#64748b" font-size="7">chain</text>
+        <line x1="810" y1="290" x2="810" y2="318" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <text x="825" y="307" fill="#64748b" font-size="7">chain</text>
+        <line x1="810" y1="385" x2="810" y2="413" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <text x="825" y="402" fill="#64748b" font-size="7">chain</text>
+
+        <!-- Worker Light → External services (download/extract/enrich) -->
+        <path d="M 720 540 L 690 540 L 690 375 L 200 375" fill="none" stroke="#fb923c" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrowhead-orange)"/>
+        <text x="240" y="370" fill="#94a3b8" font-size="7">POST PDF → MinerU</text>
+
+        <path d="M 720 540 L 690 540 L 690 265 L 200 265" fill="none" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,3"/>
+        <text x="240" y="260" fill="#94a3b8" font-size="7">DeepSeek enrich</text>
+
+        <!-- Worker GPU → Qdrant -->
+        <line x1="900" y1="625" x2="900" y2="738" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrowhead-violet)"/>
+        <text x="915" y="682" fill="#94a3b8" font-size="7">upsert chunks</text>
+
+        <!-- Job Store → Status queries -->
+        <line x1="580" y1="240" x2="580" y2="355" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3"/>
+
+        <!-- Chunking module usage -->
+        <line x1="440" y1="420" x2="500" y2="420" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3"/>
+
+        <!-- Legend -->
+        <g transform="translate(940, 100)">
+          <text x="0" y="0" fill="white" font-size="10" font-weight="600">Legend</text>
+          
+          <rect x="0" y="12" width="14" height="9" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1"/>
+          <text x="20" y="20" fill="#94a3b8" font-size="7">Worker</text>
+
+          <rect x="0" y="26" width="14" height="9" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1"/>
+          <text x="20" y="34" fill="#94a3b8" font-size="7">API / Backend</text>
+
+          <rect x="0" y="40" width="14" height="9" rx="2" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1"/>
+          <text x="20" y="48" fill="#94a3b8" font-size="7">Message Bus</text>
+
+          <rect x="0" y="54" width="14" height="9" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1"/>
+          <text x="20" y="62" fill="#94a3b8" font-size="7">Database /Store</text>
+
+          <rect x="0" y="68" width="14" height="9" rx="2" fill="rgba(136, 19, 55, 0.25)" stroke="#fb7185" stroke-width="1"/>
+          <text x="20" y="76" fill="#94a3b8" font-size="7">Pipeline Stage</text>
+
+          <rect x="0" y="82" width="14" height="9" rx="2" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1"/>
+          <text x="20" y="90" fill="#94a3b8" font-size="7">External</text>
+
+          <line x1="0" y1="100" x2="14" y2="100" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3"/>
+          <text x="20" y="103" fill="#94a3b8" font-size="7">Sync Call</text>
+
+          <line x1="0" y1="112" x2="14" y2="112" stroke="#fb923c" stroke-width="1" stroke-dasharray="3,3"/>
+          <text x="20" y="115" fill="#94a3b8" font-size="7">Async / Queue</text>
+        </g>
+
+      </svg>
+    </div>
+
+    <!-- Info Cards -->
+    <div class="cards">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot emerald"></div>
+          <h3>API Layer</h3>
+        </div>
+        <ul>
+          <li>• FastAPI :8020 — BackgroundTasks + Celery</li>
+          <li>• POST /dspace/item/{uuid} → chain por PDF</li>
+          <li>• GET /status/{job_id} — polling de progresso</li>
+          <li>• GET /result/{job_id} — markdown extraído</li>
+          <li>• POST /enrich/{job_id} — só LLM stage</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot orange"></div>
+          <h3>Orquestração Celery</h3>
+        </div>
+        <ul>
+          <li>• Broker: Redis :6379 (DB 0)</li>
+          <li>• Job Store: Redis DB 1 (TTL 7 dias)</li>
+          <li>• Filas: download, extract, llm, gpu</li>
+          <li>• Chain encadeia ctx entre stages</li>
+          <li>• Worker Light: -c 4 (I/O concurrent)</li>
+          <li>• Worker GPU: -c 1 (1 modelo na VRAM)</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-dot violet"></div>
+          <h3>Pipeline de Ingestão</h3>
+        </div>
+        <ul>
+          <li>• ① Download bitstream do DSpace REST</li>
+          <li>• ② Extração MinerU (markdown + JSON)</li>
+          <li>• ③ Enriquecimento DeepSeek (best-effort)</li>
+          <li>• ④ Chunking (1200 chars, overlap 250)</li>
+          <li>• Filtros de qualidade (OCR, tamanho)</li>
+          <li>• Embeddings bge-m3 dense + sparse</li>
+          <li>• Upsert no Qdrant collection evidencia_chunks</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <p class="footer">
+      evidencia_pipe · Fork independente do minerU · FastAPI + Celery + Qdrant + bge-m3 · GPU Server
+    </p>
+  </div>
+</body>
+</html>

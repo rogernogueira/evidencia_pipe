@@ -1,0 +1,35 @@
+# Infra de orquestração do evidencia_pipe: Redis (broker do Celery + job_store)
+# e Flower (monitor). MinerU, Qdrant e os workers Celery rodam fora deste compose
+# (no venv do host, por causa da GPU e dos modelos locais) — veja CELERY.md.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: evidencia_redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  flower:
+    image: mher/flower:2.0
+    container_name: evidencia_flower
+    command: ["celery", "--broker=redis://redis:6379/0", "flower", "--port=5555"]
+    environment:
+      # Libera a API REST (/api/*) sem autenticação. A UI web funciona sem isto.
+      FLOWER_UNAUTHENTICATED_API: "true"
+    ports:
+      - "5555:5555"        # UI em http://localhost:5555
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis_data:

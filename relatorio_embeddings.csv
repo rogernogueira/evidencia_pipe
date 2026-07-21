@@ -1,0 +1,4 @@
+doc_id,timestamp,n_chunks,total_chars,chunk_time_s,embed_time_s,upsert_time_s,total_time_s,chars_per_s,ram_delta_mb,ram_peak_mb,vram_peak_mb,avg_sparse_tokens,status
+despesas-educacao-irpf-relatorio-de-avaliacao,2026-07-07T21:19:37+00:00,401,180603,0.495,0.824,0.535,1.912,219119.6,54.7,2510.9,1093.2,53.0,ok
+rfepct-relatorio-de-avaliacao,2026-07-07T21:35:23+00:00,695,339772,0.783,1.245,0.839,2.961,272851.6,23.5,2560.8,1093.2,60.4,ok
+rfepct-relatorio-de-avaliacao,2026-07-07T22:57:46+00:00,695,339772,0.773,1.235,0.942,3.023,275025.0,45.8,2100.1,1093.2,60.4,ok

@@ -1,0 +1,5 @@
+arquivo,tempo_processamento_s,quantidade_paginas,quantidade_imagens_extraidas,quantidade_tabelas_extraidas,ram_max_mb,vram_max_mb,status
+despesas-educacao-irpf-relatorio-de-avaliacao.pdf,4.9,101,0,0,674.3,4237,Erro
+despesas-educacao-irpf-relatorio-de-avaliacao.pdf,237.51,101,51,25,1042.04,32484,Sucesso
+rfepct-relatorio-de-avaliacao.pdf,146.28,178,157,56,1051.81,35906,Sucesso
+rfepct-relatorio-de-avaliacao.pdf,99.73,178,167,56,1054.82,31361,Sucesso
