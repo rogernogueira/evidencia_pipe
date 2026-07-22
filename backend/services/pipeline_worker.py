@@ -16,7 +16,9 @@ def write_process_log(result: dict):
             "quantidade_imagens_extraidas", "quantidade_tabelas_extraidas",
             "ram_max_mb", "vram_max_mb", "status"
         ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        # extrasaction="ignore": tolera chaves extras no dict (ex.: métricas novas)
+        # sem quebrar o relatório CSV legado.
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if not file_exists:
             writer.writeheader()
         writer.writerow(result)
@@ -30,7 +32,10 @@ def write_embed_log(result: dict):
             "ram_delta_mb", "ram_peak_mb", "vram_peak_mb", "avg_sparse_tokens",
             "status"
         ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        # extrasaction="ignore": o result do chunker estrutural traz chaves extras
+        # (chunking_strategy/version/config_hash, tokenizer_name, structure_source,
+        # chunking_report) que não entram neste CSV flat — ignora em vez de quebrar.
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         if not file_exists:
             writer.writeheader()
         writer.writerow(result)
@@ -69,7 +74,8 @@ def run_pdf_pipeline(pdf_path: Path, item_uuid: str = "", item_handle: str = "")
             summary = stages.stage_index(ctx)
             set_status(job_id, "concluido", stage="index",
                        n_chunks=summary.get("chunk_count"),
-                       indexed_count=summary.get("indexed_count"))
+                       indexed_count=summary.get("indexed_count"),
+                       index_error=None)
             log.info("Pipeline Background Concluído para: %s", pdf_path.name)
         except Exception as idx_exc:
             log.error("Indexação falhou para %s: %s", pdf_path.name, idx_exc)

@@ -141,9 +141,6 @@ class BgeM3EmbedderService:
         Returns:
             Tuple[dense_vector, lexical_weights]
         """
-        if not self._model:
-            raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
-
         cache_key = (query, normalize)
         cached = _QUERY_CACHE.get(cache_key)
         if cached is not None:
@@ -152,8 +149,12 @@ class BgeM3EmbedderService:
 
         text = fold_accents(query) if normalize else query
 
-        # Inferência CUDA sob o lock da GPU (transferência do resultado p/ CPU inclusa).
+        # Inferência CUDA sob o lock da GPU. O _gpu_session garante o modelo carregado
+        # (move_to_gpu → ensure_loaded); a checagem vem DEPOIS de entrar na sessão
+        # (o modelo pode ter sido descarregado após a task anterior).
         with _gpu_session(metadata={"operation": "query-embedding"}):
+            if not self._model:
+                raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
             encoded = self._model.encode(
                 [text],
                 batch_size=1,
@@ -192,19 +193,22 @@ class BgeM3EmbedderService:
         Returns:
             Tuple[lista_de_dense_vectors, lista_de_lexical_weights]
         """
-        if not self._model:
-            raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
-
         # Preparo (fold de acentos) FORA do lock — não usa GPU.
         if normalize:
             texts = [fold_accents(t) for t in texts]
 
-        # Inferência + transferência dos resultados para CPU DENTRO do lock.
+        # Inferência + transferência dos resultados para CPU DENTRO do lock. O
+        # _gpu_session carrega/reposiciona o modelo (move_to_gpu → ensure_loaded);
+        # por isso a checagem de "carregado" vem DEPOIS de entrar na sessão — o
+        # modelo pode ter sido descarregado após a task anterior
+        # (BGE_UNLOAD_AFTER_TASK) e é aqui que ele volta.
         with _gpu_session(
             task_id=task_id,
             document_id=document_id,
             metadata={"batch_count": len(texts), "batch_size": batch_size},
         ):
+            if not self._model:
+                raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
             encoded = self._model.encode(
                 texts,
                 batch_size=batch_size,

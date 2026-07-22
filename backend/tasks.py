@@ -178,6 +178,7 @@ def indexar_qdrant(self, ctx):
             ctx.job_id, "concluido", stage="index",
             n_chunks=summary.get("chunk_count"),
             indexed_count=summary.get("indexed_count"),
+            index_error=None,  # limpa erro de índice de uma tentativa anterior (reprocess)
             **_status_extra(ctx),
         )
         clear_failed(ctx.job_id)  # indexou com sucesso → sai da fila de falhas
