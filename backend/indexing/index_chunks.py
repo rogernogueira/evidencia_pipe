@@ -28,7 +28,7 @@ from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, P
 
 from backend.indexing.chunks import MinerUChunker
 from backend.services.embedder import BgeM3EmbedderService
-from backend.core.config import QDRANT_COLLECTION, QDRANT_URL, OUTPUT_DIR
+from backend.core.config import QDRANT_COLLECTION, QDRANT_TIMEOUT_SECONDS, QDRANT_URL, OUTPUT_DIR
 from backend.core.schemas import DocumentMetadata
 
 # ---------------------------------------------------------------------------
@@ -226,10 +226,24 @@ def index_document(
     embedder: BgeM3EmbedderService,
     item_uuid: str = "",
     item_handle: str = "",
+    task_id: str | None = None,
+    *,
+    doc_id_override: str | None = None,
+    doc_path_override: str | None = None,
+    llm_payload_override: dict | None = None,
+    chunks_jsonl_path: Path | None = None,
+    upsert_batch_size: int | None = None,
 ) -> dict:
     """Processa um JSON, gera embeddings e upsert no Qdrant.
 
     Retorna dict com metricas do documento (n_chunks, tempos, memoria, etc.).
+
+    Os `*_override` permitem que o pipeline v2 (artefatos no MinIO) forneça doc_id,
+    doc_path e payload da LLM explicitamente — sem depender do layout local
+    output/<doc>/<metodo>/ (resolve_md_path/load_llm_metadata_payload). Quando
+    `chunks_jsonl_path` é informado, os chunks são persistidos em JSONL (uma linha
+    por chunk) ANTES do embedding — para posterior upload ao MinIO/auditoria. O
+    upsert no Qdrant é feito em batches de `upsert_batch_size` (config.QDRANT_UPSERT_BATCH_SIZE).
     """
     if not json_path.name.endswith(CONTENT_LIST_SUFFIX):
         raise ValueError(
@@ -237,8 +251,8 @@ def index_document(
             f"Apenas arquivos com sufixo '{CONTENT_LIST_SUFFIX}' sao aceitos."
         )
 
-    doc_id   = json_path.parent.parent.name
-    doc_path = resolve_md_path(json_path)
+    doc_id   = doc_id_override or json_path.parent.parent.name
+    doc_path = doc_path_override or resolve_md_path(json_path)
     log.info("Processando documento '%s' (%s)", doc_id, json_path)
 
     ts_inicio = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -249,13 +263,26 @@ def index_document(
     # --- Chunking ---
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
-    llm_metadata_payload = load_llm_metadata_payload(json_path)
+    llm_metadata_payload = (
+        llm_payload_override if llm_payload_override is not None
+        else load_llm_metadata_payload(json_path)
+    )
     log.debug("JSON carregado para '%s'. Blocos: %d", doc_id, len(data) if isinstance(data, list) else -1)
 
     t_chunk = time.perf_counter()
     chunks = chunker.process(data, doc_id=doc_id)
     chunk_time_s = time.perf_counter() - t_chunk
     log.info("Chunking concluido para '%s': %d chunk(s) em %.3fs.", doc_id, len(chunks), chunk_time_s)
+
+    # Persistencia dos chunks em JSONL (uma linha por chunk) — leitura incremental,
+    # reindexacao e auditoria. Feito ANTES do embedding para nao segurar memoria.
+    if chunks_jsonl_path is not None:
+        chunks_jsonl_path = Path(chunks_jsonl_path)
+        chunks_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(chunks_jsonl_path, "w", encoding="utf-8") as jf:
+            for c in chunks:
+                jf.write(json.dumps(c.model_dump(), ensure_ascii=False) + "\n")
+        log.info("Chunks de '%s' salvos em JSONL: %s (%d linha(s)).", doc_id, chunks_jsonl_path, len(chunks))
 
     # Resumo de filtros de qualidade
     rejection_info = chunker.rejection_summary
@@ -289,9 +316,12 @@ def index_document(
     total_chars = sum(len(t) for t in texts)
 
     # --- Embedding ---
+    # Só ESTE trecho toca a GPU: o embedder adquire o lock internamente (dense +
+    # sparse + transferência p/ CPU). Chunking (acima) e build de pontos + upsert
+    # no Qdrant (abaixo) ficam FORA do lock. document_id vai ao owner (diagnóstico).
     log.info("Gerando embeddings dense + sparse (bge-m3) para '%s' (%d textos, batch=%d)...", doc_id, len(texts), BATCH_SIZE)
     t_embed = time.perf_counter()
-    dense_vecs, lexical_list = embedder.embed_documents(texts, batch_size=BATCH_SIZE)
+    dense_vecs, lexical_list = embedder.embed_documents(texts, batch_size=BATCH_SIZE, document_id=doc_id, task_id=task_id)
     embed_time_s = time.perf_counter() - t_embed
     if len(dense_vecs) > 0:
         log.debug("Dimensao dense para '%s': %d", doc_id, len(dense_vecs[0]))
@@ -335,12 +365,14 @@ def index_document(
         )
     log.info("Pontos preparados para '%s': %d", doc_id, len(points))
 
-    # --- Upsert ---
+    # --- Upsert (em batches, para nao mandar um payload gigante de uma vez) ---
     t_upsert = time.perf_counter()
-    client.upsert(collection_name=COLLECTION_NAME, points=points)
+    batch = upsert_batch_size or 100
+    for start in range(0, len(points), batch):
+        client.upsert(collection_name=COLLECTION_NAME, points=points[start:start + batch])
     upsert_time_s = time.perf_counter() - t_upsert
     total_time_s  = time.perf_counter() - t_total
-    log.info("Upsert concluido para '%s' em %.3fs.", doc_id, upsert_time_s)
+    log.info("Upsert concluido para '%s' em %.3fs (%d ponto(s), batch=%d).", doc_id, upsert_time_s, len(points), batch)
 
     return {
         "doc_id":            doc_id,
@@ -389,7 +421,7 @@ def _get_indexer() -> tuple[QdrantClient, MinerUChunker, BgeM3EmbedderService]:
     """Constrói (uma vez) os singletons de indexação. O embedder reusa o _SHARED_MODEL global."""
     global _api_client, _api_chunker, _api_embedder, _api_ready
     if not _api_ready:
-        _api_client = QdrantClient(url=QDRANT_URL)
+        _api_client = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS or None)
         _api_embedder = BgeM3EmbedderService()
         _api_embedder.load_model(require_cache=False)  # reusa o modelo já carregado, se houver
         _api_chunker = MinerUChunker()
@@ -398,7 +430,7 @@ def _get_indexer() -> tuple[QdrantClient, MinerUChunker, BgeM3EmbedderService]:
     return _api_client, _api_chunker, _api_embedder
 
 
-def index_single_document(json_path: Path, item_uuid: str = "", item_handle: str = "") -> dict:
+def index_single_document(json_path: Path, item_uuid: str = "", item_handle: str = "", task_id: str | None = None) -> dict:
     """Indexa um único documento no Qdrant (caminho da API). Reusa singletons e
     remove pontos anteriores do mesmo doc_id (evita duplicação em re-upload).
 
@@ -417,13 +449,294 @@ def index_single_document(json_path: Path, item_uuid: str = "", item_handle: str
         ),
     )
     log.info("Pontos anteriores de '%s' removidos antes da re-indexação (se houver).", doc_name)
-    return index_document(client, json_path, chunker, embedder, item_uuid=item_uuid, item_handle=item_handle)
+    return index_document(client, json_path, chunker, embedder, item_uuid=item_uuid, item_handle=item_handle, task_id=task_id)
+
+
+def index_materialized_document(
+    json_path: Path,
+    *,
+    doc_id: str,
+    doc_path: str = "",
+    llm_metadata_payload: dict | None = None,
+    item_uuid: str = "",
+    item_handle: str = "",
+    bitstream_uuid: str | None = None,
+    document_checksum: str = "",
+    source_artifact_uri: str = "",
+    document_title: str | None = None,
+    markdown_path: Path | None = None,
+    task_id: str | None = None,
+    chunks_jsonl_path: Path | None = None,
+    chunking_report_path: Path | None = None,
+    upsert_batch_size: int | None = None,
+    strategy: str | None = None,
+) -> dict:
+    """Indexa um content_list_v2.json JÁ MATERIALIZADO localmente a partir do MinIO
+    (pipeline v2), com doc_id/doc_path/payload LLM explícitos — sem depender do
+    layout output/<doc>/<metodo>/.
+
+    Se `CHUNKING_STRATEGY` (ou `strategy`) for `structural_tokens`/`legacy_chars`, usa
+    o novo caminho estrutural (StructuralTokenChunker/LegacyCharacterChunker via
+    interface comum); caso contrário, cai no caminho legado direto (MinerUChunker).
+    """
+    from backend.core import config as settings
+
+    strategy = (strategy or settings.CHUNKING_STRATEGY).strip().lower()
+    return _index_structural_document(
+        json_path, doc_id=doc_id, doc_path=doc_path,
+        llm_metadata_payload=llm_metadata_payload or {},
+        item_uuid=item_uuid, item_handle=item_handle, bitstream_uuid=bitstream_uuid,
+        document_checksum=document_checksum, source_artifact_uri=source_artifact_uri,
+        document_title=document_title, markdown_path=markdown_path, task_id=task_id,
+        chunks_jsonl_path=chunks_jsonl_path, chunking_report_path=chunking_report_path,
+        upsert_batch_size=upsert_batch_size or settings.QDRANT_UPSERT_BATCH_SIZE,
+        strategy=strategy,
+    )
+
+
+def _index_structural_document(
+    json_path: Path,
+    *,
+    doc_id: str,
+    doc_path: str,
+    llm_metadata_payload: dict,
+    item_uuid: str,
+    item_handle: str,
+    bitstream_uuid: str | None,
+    document_checksum: str,
+    source_artifact_uri: str,
+    document_title: str | None,
+    markdown_path: Path | None,
+    task_id: str | None,
+    chunks_jsonl_path: Path | None,
+    chunking_report_path: Path | None,
+    upsert_batch_size: int,
+    strategy: str,
+) -> dict:
+    """Caminho estrutural por tokens (§24).
+
+    Ordem: parse → chunk → persistência JSONL → embeddings (ÚNICO trecho sob o lock
+    da GPU) → build de pontos → upsert dos NOVOS → só então remove versões antigas
+    (§27: uma falha antes do upsert não apaga os chunks ativos anteriores).
+    """
+    import uuid as _uuid
+    from backend.core import config as settings
+    from backend.indexing.chunk_models import ChunkingError
+    from backend.indexing.chunks import get_chunker
+    from backend.indexing.document_blocks import MinerUDocumentParser
+
+    client, _, embedder = _get_indexer()
+    json_path = Path(json_path).resolve()
+    doc_path = doc_path or f"{doc_id}.md"
+    doc_name = Path(doc_path).name if doc_path.endswith(".md") else f"{doc_id}.md"
+
+    ts_inicio = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ram_inicio = _ram_mb()
+    t_total = time.perf_counter()
+
+    # --- Parse estrutural (CPU, FORA do lock da GPU) ---
+    t_parse = time.perf_counter()
+    parser = MinerUDocumentParser(
+        remove_repeated_headers=settings.CHUNK_REMOVE_REPEATED_HEADERS,
+        remove_repeated_footers=settings.CHUNK_REMOVE_REPEATED_FOOTERS,
+        keep_footnotes=settings.CHUNK_KEEP_FOOTNOTES,
+    )
+    try:
+        blocks, structure_source = parser.parse_json_file(json_path)
+        if not blocks and markdown_path and Path(markdown_path).exists():
+            blocks, structure_source = parser.parse_markdown(Path(markdown_path).read_text(encoding="utf-8"))
+    except ChunkingError as exc:
+        if markdown_path and Path(markdown_path).exists():
+            log.warning("[index] parse JSON falhou (%s) — fallback markdown para '%s'.", exc, doc_id)
+            blocks, structure_source = parser.parse_markdown(Path(markdown_path).read_text(encoding="utf-8"))
+        else:
+            raise
+    parse_time_s = time.perf_counter() - t_parse
+    title = document_title or parser.document_title
+
+    # --- Chunking (CPU, FORA do lock da GPU) ---
+    t_chunk = time.perf_counter()
+    chunker = get_chunker(strategy)
+    result = chunker.chunk(
+        blocks, document_id=doc_id, document_title=title,
+        document_checksum=document_checksum, item_uuid=item_uuid,
+        bitstream_uuid=bitstream_uuid, source_artifact_uri=source_artifact_uri,
+        structure_source=structure_source,
+    )
+    result.metrics.parse_time_s = parse_time_s
+    chunk_time_s = time.perf_counter() - t_chunk
+    chunks = result.chunks
+    log.info("[index] '%s': %d chunk(s) (%s) em %.3fs.", doc_id, len(chunks), strategy, chunk_time_s)
+
+    # --- Persistência JSONL + relatório ANTES do embedding (§23) ---
+    if chunks_jsonl_path is not None:
+        chunks_jsonl_path = Path(chunks_jsonl_path)
+        chunks_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(chunks_jsonl_path, "w", encoding="utf-8") as jf:
+            for c in chunks:
+                jf.write(json.dumps(c.model_dump(), ensure_ascii=False) + "\n")
+        log.info("[index] chunks de '%s' salvos em JSONL: %s (%d linha(s)).", doc_id, chunks_jsonl_path, len(chunks))
+    report = result.report()
+    if chunking_report_path is not None:
+        chunking_report_path = Path(chunking_report_path)
+        chunking_report_path.parent.mkdir(parents=True, exist_ok=True)
+        chunking_report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if not chunks:
+        log.warning("[index] nenhum chunk gerado para '%s'.", doc_id)
+        return {
+            "doc_id": doc_id, "timestamp": ts_inicio, "n_chunks": 0, "total_chars": 0,
+            "chunk_time_s": round(chunk_time_s, 3), "embed_time_s": 0.0, "upsert_time_s": 0.0,
+            "total_time_s": round(time.perf_counter() - t_total, 3), "chars_per_s": 0.0,
+            "ram_delta_mb": 0.0, "ram_peak_mb": round(ram_inicio, 1), "vram_peak_mb": 0.0,
+            "avg_sparse_tokens": 0.0, "status": "vazio", "chunking_strategy": strategy,
+            "chunking_report": report,
+        }
+
+    # --- Texto a embeddar (contextualized_text | text) ---
+    field = settings.EMBEDDING_TEXT_FIELD
+    texts = [c.embedding_input(field) for c in chunks]
+    total_chars = sum(len(t) for t in texts)
+
+    # --- Embedding (ÚNICO trecho sob o lock da GPU) ---
+    t_embed = time.perf_counter()
+    dense_vecs, lexical_list = embedder.embed_documents(
+        texts, batch_size=settings.EMBEDDING_BATCH_SIZE, document_id=doc_id, task_id=task_id
+    )
+    embed_time_s = time.perf_counter() - t_embed
+    avg_sparse_tokens = sum(len(lw) for lw in lexical_list) / len(lexical_list) if lexical_list else 0.0
+    ram_pos = _ram_mb()
+
+    # --- Build de pontos (FORA do lock) ---
+    document_version = f"{document_checksum}:{result.chunking_config_hash}"
+    point_ns = _uuid.uuid5(_uuid.NAMESPACE_URL, "evidencia_pipe/chunk")
+    points: list[PointStruct] = []
+    for chunk, dense, lw in zip(chunks, dense_vecs, lexical_list):
+        sparse_indices, sparse_values = _lexical_to_sparse(lw)
+        payload = _structural_payload(
+            chunk, doc_id=doc_id, doc_name=doc_name, doc_path=doc_path,
+            item_uuid=item_uuid, item_handle=item_handle, document_version=document_version,
+            llm_metadata_payload=llm_metadata_payload,
+        )
+        points.append(PointStruct(
+            id=str(_uuid.uuid5(point_ns, chunk.chunk_id)),
+            vector={"dense": dense, "sparse": {"indices": sparse_indices, "values": sparse_values}},
+            payload=payload,
+        ))
+
+    # --- Upsert dos NOVOS pontos (§27: só depois de gerar/persistir/embeddar) ---
+    t_upsert = time.perf_counter()
+    for start in range(0, len(points), upsert_batch_size):
+        client.upsert(collection_name=COLLECTION_NAME, points=points[start:start + upsert_batch_size])
+    upsert_time_s = time.perf_counter() - t_upsert
+
+    # --- Remove versões ANTIGAS do documento (mesmo doc_name, outra document_version).
+    # Feito APÓS o upsert confirmado dos novos — nunca antes (§27). Falha aqui é
+    # best-effort (não invalida a indexação nova).
+    try:
+        client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=Filter(
+                must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))],
+                must_not=[FieldCondition(key="document_version", match=MatchValue(value=document_version))],
+            ),
+        )
+    except Exception as exc:
+        log.warning("[index] limpeza de versões antigas de '%s' falhou (best-effort): %s", doc_name, exc)
+
+    total_time_s = time.perf_counter() - t_total
+    log.info("[index] '%s' indexado: %d ponto(s), embed=%.2fs upsert=%.2fs.", doc_id, len(points), embed_time_s, upsert_time_s)
+    return {
+        "doc_id": doc_id, "timestamp": ts_inicio, "n_chunks": len(points), "total_chars": total_chars,
+        "chunk_time_s": round(chunk_time_s, 3), "embed_time_s": round(embed_time_s, 3),
+        "upsert_time_s": round(upsert_time_s, 3), "total_time_s": round(total_time_s, 3),
+        "chars_per_s": round(total_chars / embed_time_s, 1) if embed_time_s > 0 else 0.0,
+        "ram_delta_mb": round(ram_pos - ram_inicio, 1), "ram_peak_mb": round(max(ram_inicio, ram_pos), 1),
+        "vram_peak_mb": round(_vram_mb(), 1), "avg_sparse_tokens": round(avg_sparse_tokens, 1),
+        "status": "ok", "chunking_strategy": strategy, "chunking_version": result.chunking_version,
+        "chunking_config_hash": result.chunking_config_hash, "tokenizer_name": result.tokenizer_name,
+        "structure_source": structure_source, "chunking_report": report,
+    }
+
+
+def _structural_payload(
+    chunk, *, doc_id: str, doc_name: str, doc_path: str, item_uuid: str,
+    item_handle: str, document_version: str, llm_metadata_payload: dict,
+) -> dict:
+    """Payload do Qdrant para um StructuralChunk (§26). Sem embeddings/imagens/JSON
+    MinerU completo/objetos não serializáveis."""
+    from backend.core import config as settings
+
+    payload = {
+        "chunk_id": chunk.chunk_id,
+        "chunk_index": chunk.chunk_index,
+        "document_id": chunk.document_id,
+        "item_uuid": item_uuid or chunk.item_uuid,
+        "bitstream_uuid": chunk.bitstream_uuid,
+        "text": chunk.text,
+        "document_title": chunk.document_title,
+        "section_title": chunk.section_title,
+        "section_path": chunk.section_path,
+        "content_type": chunk.content_type,
+        "token_count": chunk.token_count,
+        "embedding_token_count": chunk.embedding_token_count,
+        "page_start": chunk.page_start,
+        "page_end": chunk.page_end,
+        "page_numbers": chunk.page_numbers,
+        "chunking_strategy": chunk.chunking_strategy,
+        "chunking_version": chunk.chunking_version,
+        "chunking_config_hash": chunk.chunking_config_hash,
+        "tokenizer_name": chunk.tokenizer_name,
+        "source_artifact_uri": chunk.source_artifact_uri,
+        "document_checksum": chunk.document_checksum,
+        "document_version": document_version,
+        "active": True,
+        "pipeline_version": settings.PIPELINE_VERSION,
+        # Compatibilidade com a busca existente (filtros por doc_name/doc_id/page/section).
+        "content": chunk.text,
+        "doc_id": f"{doc_id}.pdf",
+        "doc_name": doc_name,
+        "doc_path": doc_path,
+        "page": chunk.page_start,
+        "section": chunk.section_title,
+        "type": chunk.content_type,
+    }
+    if item_handle:
+        payload["item_handle"] = item_handle
+    payload.update(llm_metadata_payload)
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def push_llm_metadata_to_qdrant(doc_id: str, payload: dict) -> int:
+    """Propaga um payload de metadados LLM JÁ CARREGADO para os pontos existentes
+    do documento no Qdrant, via set_payload (merge de chaves, sem re-embedar).
+
+    É o mecanismo que DESACOPLA o enrich da indexação: o índice não depende do LLM
+    e, quando o enrich roda (antes ou depois da indexação), os metadados chegam
+    aqui como um merge de payload — sem re-embedar nem reindexar.
+
+    Retorna o número de pontos atualizados (0 se o doc ainda não foi indexado ou
+    se não há payload a propagar)."""
+    if not payload:
+        return 0
+
+    client, _, _ = _get_indexer()
+    doc_name = f"{doc_id}.md"
+    selector = Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))])
+    n = client.count(collection_name=COLLECTION_NAME, count_filter=selector, exact=True).count
+    if n == 0:
+        log.info("push_llm_metadata_to_qdrant: doc '%s' ainda não indexado (0 pontos).", doc_id)
+        return 0
+
+    client.set_payload(collection_name=COLLECTION_NAME, payload=payload, points=selector, wait=True)
+    log.info("push_llm_metadata_to_qdrant: metadados LLM propagados a %d ponto(s) de '%s'.", n, doc_id)
+    return n
 
 
 def sync_llm_metadata_to_qdrant(doc_id: str) -> int:
-    """Propaga os metadados LLM (<doc>_metadata_llm.json) para os pontos já
-    existentes do documento no Qdrant, via set_payload (merge de chaves, sem
-    re-embedar). Cobre o caso do enrich rodar DEPOIS da indexação.
+    """Variante que lê os metadados LLM do layout local (<doc>_metadata_llm.json)
+    e os propaga ao Qdrant. Usada pelo fluxo legado (enrich_job). O fluxo v2 (MinIO)
+    usa push_llm_metadata_to_qdrant com o payload já em mãos.
 
     Retorna o número de pontos atualizados (0 se o doc ainda não foi indexado
     ou se não há metadados LLM a propagar)."""
@@ -437,17 +750,7 @@ def sync_llm_metadata_to_qdrant(doc_id: str) -> int:
         log.info("sync_llm_metadata_to_qdrant: sem metadados LLM para '%s' — nada a propagar.", doc_id)
         return 0
 
-    client, _, _ = _get_indexer()
-    doc_name = f"{doc_id}.md"
-    selector = Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))])
-    n = client.count(collection_name=COLLECTION_NAME, count_filter=selector, exact=True).count
-    if n == 0:
-        log.info("sync_llm_metadata_to_qdrant: doc '%s' ainda não indexado (0 pontos).", doc_id)
-        return 0
-
-    client.set_payload(collection_name=COLLECTION_NAME, payload=payload, points=selector, wait=True)
-    log.info("sync_llm_metadata_to_qdrant: metadados LLM propagados a %d ponto(s) de '%s'.", n, doc_id)
-    return n
+    return push_llm_metadata_to_qdrant(doc_id, payload)
 
 
 EMBEDDING_CSV_HEADERS = [
@@ -577,7 +880,7 @@ def main() -> None:
 
     print(f"\nConectando ao Qdrant em {args.url}...")
     try:
-        client = QdrantClient(url=args.url)
+        client = QdrantClient(url=args.url, timeout=QDRANT_TIMEOUT_SECONDS or None)
         client.get_collections()
         print("Conexao OK")
         log.info("Conexao com Qdrant estabelecida com sucesso.")

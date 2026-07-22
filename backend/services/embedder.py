@@ -1,14 +1,62 @@
 from collections import OrderedDict
-from typing import Optional, Tuple, List, Dict
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional, Tuple, List, Dict
 
 from FlagEmbedding import BGEM3FlagModel
 from huggingface_hub import try_to_load_from_cache
 from unidecode import unidecode
 
+from backend.core import config as settings
 from backend.core.config import DENSE_MODEL
 from backend.core.logger import log
 
 _SHARED_MODEL: Optional[BGEM3FlagModel] = None
+
+
+@contextmanager
+def _gpu_session(
+    *,
+    task_id: Optional[str] = None,
+    document_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> Iterator[Any]:
+    """Adquire o recurso de GPU (via gpu_resource_manager) SOMENTE ao redor do
+    trabalho CUDA do BGE-M3: move o modelo para a GPU, roda a inferência, e antes
+    de liberar o lease move o modelo para CPU / descarrega e limpa a VRAM.
+
+    Fora do lock ficam: leitura de chunks, chunking, filtros, build de payload e
+    upsert no Qdrant (esses acontecem em index_chunks.py, antes/depois do embed).
+
+    Se GPU_MANAGER_ENABLED=false, roda sem coordenação (compatível com dev sem
+    Redis dedicado). Fail-closed: se o Redis do manager estiver fora, a chamada
+    de acquire lança GPUBackendUnavailable e a inferência NÃO ocorre."""
+    if not settings.GPU_MANAGER_ENABLED:
+        yield None
+        return
+
+    # Imports tardios: mantêm o embedder utilizável em contextos sem o manager
+    # e evitam ciclos de import na carga do módulo.
+    from backend.services.gpu_manager import get_gpu_manager
+    from backend.services.bge_model_manager import get_model_manager
+
+    manager = get_gpu_manager()
+    model_manager = get_model_manager()
+    with manager.acquire(
+        resource=settings.GPU_RESOURCE_NAME,
+        service="bge-m3",
+        priority=settings.BGE_GPU_PRIORITY,
+        task_id=task_id,
+        document_id=document_id,
+        metadata={"operation": "dense-sparse-embedding", **(metadata or {})},
+    ) as lease:
+        model_manager.move_to_gpu()
+        try:
+            yield lease
+        finally:
+            # 1) sincroniza CUDA, 2) modelo → CPU/unload, 3) empty_cache — ANTES de
+            # liberar o lease (o lock Redis não libera VRAM sozinho).
+            model_manager.release_gpu_if_configured()
+            lease.ensure_valid()
 
 # Cache LRU do embedding de query (dense + sparse), chaveado por (query, normalize).
 # Permite alternar filtros sem re-embedar a mesma query — só o ANN filtrado roda.
@@ -104,16 +152,17 @@ class BgeM3EmbedderService:
 
         text = fold_accents(query) if normalize else query
 
-        encoded = self._model.encode(
-            [text],
-            batch_size=1,
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,
-        )
-
-        dense_vector = encoded["dense_vecs"][0].tolist()
-        lexical_weights = encoded["lexical_weights"][0]
+        # Inferência CUDA sob o lock da GPU (transferência do resultado p/ CPU inclusa).
+        with _gpu_session(metadata={"operation": "query-embedding"}):
+            encoded = self._model.encode(
+                [text],
+                batch_size=1,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+            )
+            dense_vector = encoded["dense_vecs"][0].tolist()
+            lexical_weights = encoded["lexical_weights"][0]
 
         _QUERY_CACHE[cache_key] = (dense_vector, lexical_weights)
         if len(_QUERY_CACHE) > _QUERY_CACHE_MAX:
@@ -121,8 +170,20 @@ class BgeM3EmbedderService:
 
         return dense_vector, lexical_weights
 
-    def embed_documents(self, texts: List[str], batch_size: int = 32, normalize: bool = False) -> Tuple[List[List[float]], List[Dict[str, float]]]:
+    def embed_documents(
+        self,
+        texts: List[str],
+        batch_size: int = 32,
+        normalize: bool = False,
+        *,
+        task_id: Optional[str] = None,
+        document_id: Optional[str] = None,
+    ) -> Tuple[List[List[float]], List[Dict[str, float]]]:
         """Gera embeddings em batch para múltiplos documentos.
+
+        A inferência CUDA (dense + sparse) roda sob o lock da GPU; o preparo dos
+        textos (fold de acentos) fica FORA do lock. task_id/document_id são
+        propagados ao gpu_resource_manager como metadados de diagnóstico.
 
         Args:
             normalize: Se True, remove acentos (unidecode) antes de embeddar. Deve casar
@@ -134,22 +195,28 @@ class BgeM3EmbedderService:
         if not self._model:
             raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
 
+        # Preparo (fold de acentos) FORA do lock — não usa GPU.
         if normalize:
             texts = [fold_accents(t) for t in texts]
 
-        encoded = self._model.encode(
-            texts,
-            batch_size=batch_size,
-            return_dense=True,
-            return_sparse=True,
-            return_colbert_vecs=False,
-        )
-        
-        # Dense vecs já vêm como numpy array, convertendo iteravelmente é mais seguro se list() direto falhar
-        # dependendo do shape. Se for (N, 1024), v.tolist() funciona.
-        dense_vecs = [v.tolist() for v in encoded["dense_vecs"]]
-        lexical_list = encoded["lexical_weights"]
-        
+        # Inferência + transferência dos resultados para CPU DENTRO do lock.
+        with _gpu_session(
+            task_id=task_id,
+            document_id=document_id,
+            metadata={"batch_count": len(texts), "batch_size": batch_size},
+        ):
+            encoded = self._model.encode(
+                texts,
+                batch_size=batch_size,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+            )
+            # Dense vecs já vêm como numpy array (CPU); converter aqui é a
+            # "transferência dos resultados para CPU" antes de soltar o lease.
+            dense_vecs = [v.tolist() for v in encoded["dense_vecs"]]
+            lexical_list = encoded["lexical_weights"]
+
         return dense_vecs, lexical_list
         
     def get_dense_dimension(self) -> int:

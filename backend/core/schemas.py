@@ -1,4 +1,8 @@
-from typing import Optional
+import json
+from datetime import datetime, timezone
+from typing import Any, Mapping, Optional
+from uuid import UUID
+
 from pydantic import BaseModel, ConfigDict, Field
 
 class ChunkMetadata(BaseModel):
@@ -77,3 +81,219 @@ class DocumentMetadata(LlmMetadataCandidates):
     llm_utilizada: Optional[str] = Field(None, description="Modelo LLM usado")
     quantidade_tokens: Optional[int] = Field(None, description="Total de tokens (prompt+completion) da chamada")
     tempo_processamento: Optional[float] = Field(None, description="Tempo da geração dos metadados (s)")
+
+
+# ==========================================================================
+# Pipeline v2 — contexto leve + referências tipadas + manifesto de artefatos.
+#
+# A Celery chain transporta SOMENTE o PipelineContext (pequeno, JSON-serializável).
+# Todo conteúdo (PDF, markdown, JSON MinerU, chunks, imagens, relatórios) vive no
+# MinIO e é descoberto pelo manifesto (artifact_manifest_uri).
+# ==========================================================================
+
+# Nomes canônicos dos estágios registrados no manifesto (`manifest.stages`).
+STAGE_DOWNLOAD = "download"
+STAGE_MINERU = "mineru"
+STAGE_ENRICHMENT = "enrichment"
+STAGE_INDEXING = "indexing"
+
+# Rótulos de progresso no PipelineContext.current_stage.
+CTX_STAGE_QUEUED = "queued"
+CTX_STAGE_DOWNLOADED = "downloaded"
+CTX_STAGE_EXTRACTED = "extracted"
+CTX_STAGE_ENRICHED = "enriched"
+CTX_STAGE_INDEXED = "indexed"
+
+# Nomes lógicos dos artefatos (chaves em `manifest.artifacts`).
+ART_SOURCE_PDF = "source_pdf"
+ART_MINERU_MARKDOWN = "mineru_markdown"
+ART_MINERU_CONTENT_LIST = "mineru_content_list"
+ART_MINERU_METRICS = "mineru_metrics"
+ART_MINERU_IMAGES = "mineru_images"
+ART_MINERU_IMAGES_MANIFEST = "mineru_images_manifest"
+ART_METADATA_CANDIDATES = "metadata_candidates"
+ART_LLM_RAW_RESPONSE = "llm_raw_response"
+ART_CHUNKS = "chunks"
+ART_CHUNKING_REPORT = "chunking_report"
+ART_EMBEDDING_REPORT = "embedding_report"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class ArtifactReference(BaseModel):
+    """Referência tipada a um objeto no MinIO. NÃO contém o conteúdo do objeto.
+
+    `etag` NÃO deve ser tratado como SHA-256: uploads multipart produzem ETags
+    que não representam o hash íntegro do conteúdo. O `sha256` é sempre calculado
+    explicitamente pelo pipeline.
+
+    Para "diretórios" lógicos (prefixo de imagens), use `object_count`/
+    `total_size_bytes` e content_type `application/x-directory-prefix`; nesse caso
+    `sha256`/`size_bytes` podem ficar vazios.
+    """
+
+    name: str
+    uri: str
+    bucket: str
+    object_key: str
+    content_type: str = "application/octet-stream"
+    size_bytes: int = 0
+    sha256: str = ""
+    etag: Optional[str] = None
+    version_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    metadata: dict[str, str] = Field(default_factory=dict)
+    # Somente para referências de prefixo (ex.: imagens).
+    object_count: Optional[int] = None
+    total_size_bytes: Optional[int] = None
+
+
+class StageState(BaseModel):
+    """Estado de um estágio no manifesto."""
+
+    status: str = "PENDING"  # PENDING | RUNNING | COMPLETED | FAILED
+    attempt: int = 0
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+
+class ManifestError(BaseModel):
+    stage: str
+    error_type: str
+    message: str
+    attempt: int = 1
+    object_key: Optional[str] = None
+    at: datetime = Field(default_factory=_utcnow)
+
+
+class ArtifactManifest(BaseModel):
+    """Manifesto por-documento — fonte de descoberta dos artefatos. Persistido em
+    minio://<bucket>/<prefix>/<pipeline_id>/<document_id>/manifest.json."""
+
+    schema_version: str = "1.0"
+    revision: int = 0
+    pipeline_id: str
+    job_id: str
+    item_uuid: Optional[str] = None
+    item_handle: Optional[str] = None
+    bitstream_uuid: Optional[str] = None
+    document_id: str
+    pipeline_version: str = "2.0"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    status: str = "RUNNING"  # RUNNING | COMPLETED | FAILED
+
+    artifacts: dict[str, ArtifactReference] = Field(default_factory=dict)
+    stages: dict[str, StageState] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+    errors: list[ManifestError] = Field(default_factory=list)
+
+    def stage(self, name: str) -> StageState:
+        st = self.stages.get(name)
+        if st is None:
+            st = StageState()
+            self.stages[name] = st
+        return st
+
+    def is_stage_completed(self, name: str) -> bool:
+        st = self.stages.get(name)
+        return bool(st and st.status == "COMPLETED")
+
+
+class PipelineContext(BaseModel):
+    """Contexto leve transportado pela Celery chain — apenas identificadores e a
+    URI do manifesto. Validado na entrada e na saída de cada task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pipeline_id: UUID
+    job_id: str
+    item_uuid: str = ""
+    bitstream_uuid: Optional[str] = None
+    document_id: str
+    artifact_manifest_uri: str
+    current_stage: str
+    pipeline_version: str = "2.0"
+    warnings_count: int = 0
+    force: bool = False  # reprocessamento forçado (ignora artefatos existentes)
+
+    def to_message(self) -> dict[str, Any]:
+        """Serialização JSON-safe para trafegar na chain (UUID → str)."""
+        return json.loads(self.model_dump_json())
+
+
+# --------------------------------------------------------------------------
+# Barreira anti-regressão do payload da chain (§26/§27).
+# --------------------------------------------------------------------------
+
+class PipelinePayloadTooLargeError(ValueError):
+    """O contexto retornado por uma task excedeu CELERY_CHAIN_MAX_PAYLOAD_BYTES."""
+
+
+class ForbiddenChainPayloadError(ValueError):
+    """O contexto retornado por uma task contém uma chave/estrutura proibida
+    (markdown, chunks, embeddings, bytes, etc.)."""
+
+
+# Chaves cujo NOME denuncia transporte de conteúdo grande pela chain.
+FORBIDDEN_CONTEXT_KEYS = frozenset({
+    "markdown", "markdown_content", "full_text", "content_list", "mineru_json",
+    "chunks", "embeddings", "dense_vectors", "sparse_vectors", "qdrant_points",
+    "images", "binary_data", "raw_response", "pdf_bytes", "file_content",
+})
+
+
+def _looks_like_binary(value: Any) -> bool:
+    return isinstance(value, (bytes, bytearray, memoryview))
+
+
+def validate_chain_payload_size(
+    payload: Mapping[str, Any],
+    max_bytes: int,
+    *,
+    enforce_lightweight: bool = True,
+) -> int:
+    """Valida o payload de saída de uma task ANTES de retorná-lo à chain.
+
+    1. rejeita chaves proibidas (nome) e valores binários/não-serializáveis;
+    2. serializa em JSON e mede em bytes;
+    3. rejeita acima do limite.
+
+    Retorna o tamanho serializado (bytes). Não registra o conteúdo, apenas o
+    tamanho e o motivo — para não vazar dado sensível nos logs.
+    """
+    if not isinstance(payload, Mapping):
+        raise ForbiddenChainPayloadError(
+            f"payload da chain deve ser um mapeamento, veio {type(payload).__name__}."
+        )
+
+    if enforce_lightweight:
+        for key, value in payload.items():
+            if key.lower() in FORBIDDEN_CONTEXT_KEYS:
+                raise ForbiddenChainPayloadError(
+                    f"chave proibida no payload da chain: '{key}'."
+                )
+            if _looks_like_binary(value):
+                raise ForbiddenChainPayloadError(
+                    f"valor binário proibido no payload da chain (chave '{key}')."
+                )
+
+    try:
+        # SEM default=str: valores não-serializáveis (sets, objetos, DataFrames,
+        # arrays, tensores) devem FALHAR aqui, não serem silenciosamente convertidos.
+        serialized = json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ForbiddenChainPayloadError(
+            f"payload da chain não é serializável em JSON: {exc}"
+        ) from exc
+
+    size = len(serialized.encode("utf-8"))
+    if size > max_bytes:
+        raise PipelinePayloadTooLargeError(
+            f"payload da chain tem {size} bytes (> limite {max_bytes})."
+        )
+    return size

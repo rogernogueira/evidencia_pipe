@@ -539,3 +539,84 @@ def detectar_palavras_quebradas(texto: str) -> list[str]:
     padrao = r"\b(?:[A-Za-zÀ-ÿ]{1,2}\s+){3,}[A-Za-zÀ-ÿ]{1,8}\b"
     achados = re.findall(padrao, texto)
     return [a.strip() for a in achados]
+
+
+# ===========================================================================
+# Integração com o chunking estrutural por tokens (§22).
+#
+# Reaproveita os MESMOS sete filtros acima, porém decidindo o mínimo por TOKENS e
+# por CONTENT_TYPE — títulos, tabelas, listas, legendas, notas e referências NÃO
+# são rejeitados só por serem curtos (§22). O ruído de OCR e a ausência de corpo
+# textual continuam eliminatórios para conteúdo comum.
+# ===========================================================================
+
+from dataclasses import dataclass as _dataclass  # noqa: E402
+
+
+@_dataclass
+class FilterOutcome:
+    """Veredito enxuto usado pelo StructuralTokenChunker (desacopla dos internos)."""
+
+    approved: bool
+    reason: str = "aprovado"
+    quality: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.quality is None:
+            self.quality = {}
+
+
+# Tipos de conteúdo cujo tamanho mínimo NÃO é aplicado (relevantes mesmo curtos, §22):
+# tabelas, listas, legendas, fórmulas, notas e referências são preservadas ainda que
+# curtas. O mínimo por tokens só vale para conteúdo textual comum (paragraph/unknown).
+_MIN_TOKENS_EXEMPT_TYPES = frozenset({
+    "table", "list", "figure_caption", "references", "formula", "quote", "footnote",
+})
+
+
+def evaluate_structural_chunk(
+    text: str,
+    content_type: str,
+    token_count: int,
+    section_path: list[str] | None = None,
+    *,
+    min_tokens: int = MIN_TOKENS_DEFAULT,
+    ocr_noise_threshold: float = 0.65,
+) -> FilterOutcome:
+    """Avalia um chunk estrutural já formado (texto contextualizável à parte).
+
+    Ordem: corpo textual → OCR (só p/ conteúdo comum) → mínimo por token.
+    O mínimo (`min_tokens`) é o configurado no chunker (CHUNK_MIN_TOKENS); tabelas,
+    listas, legendas, títulos, notas e referências pequenas NÃO são rejeitadas (§22).
+    """
+    section_path = section_path or []
+    stripped = text.strip()
+    if not stripped:
+        return FilterOutcome(approved=False, reason="vazio")
+
+    # 1) Corpo textual real — eliminatório para conteúdo comum.
+    body = filter_no_body_text(text, content_type)
+    if not body.approved and content_type not in _MIN_TOKENS_EXEMPT_TYPES:
+        return FilterOutcome(approved=False, reason=body.reason,
+                             quality={"token_count": token_count})
+
+    # 2) Ruído de OCR — só para conteúdo comum (tabelas/fórmulas têm símbolos legítimos).
+    if content_type in ("paragraph", "references", "quote", "footnote"):
+        noise = _calc_ocr_noise_score(text)
+        if noise >= ocr_noise_threshold:
+            return FilterOutcome(approved=False, reason="ruido_ocr_excessivo",
+                                 quality={"ocr_noise_score": noise, "token_count": token_count})
+
+    # 3) Mínimo por tokens — exceção para tipos relevantes ainda que curtos e para
+    #    chunks textualmente completos (frase bem formada abaixo do mínimo).
+    if content_type not in _MIN_TOKENS_EXEMPT_TYPES and token_count < min_tokens:
+        if not _is_semantically_complete(text):
+            return FilterOutcome(approved=False, reason="abaixo_do_minimo_de_tokens",
+                                 quality={"token_count": token_count, "min_tokens": min_tokens})
+
+    ocr = _calc_ocr_noise_score(text)
+    return FilterOutcome(approved=True, reason="aprovado", quality={
+        "token_count": token_count,
+        "ocr_noise_score": ocr,
+        "content_type": content_type,
+    })

@@ -8,7 +8,7 @@ dependencies = [
     "fastapi>=0.135.2",
     "uvicorn>=0.42.0",
     "python-multipart>=0.0.22",
-    "mineru[all]==3.2.0",
+    "mineru[all]~=3.4.4",
     "pypdf>=6.9.2",
     "psutil>=7.2.2",
     "qdrant-client[fastembed]>=1.14.0",
@@ -26,4 +26,22 @@ dependencies = [
     "markdownify>=0.14.1",
     "celery[redis]>=5.4",
     "flower>=2.0.1",
+    # Coordenação da GPU compartilhada (mutex distribuído + fila/prioridade/aging).
+    # Biblioteca independente, membro do workspace uv (packages/gpu_resource_manager).
+    "gpu-resource-manager",
+    "minio>=7.2.20",
 ]
+
+# --- Workspace uv --------------------------------------------------------------
+# packages/gpu_resource_manager é uma biblioteca independente (empacotável como
+# wheel e instalável em outros repositórios), desenvolvida aqui como membro do
+# workspace. `uv sync` a instala em modo editável automaticamente.
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+gpu-resource-manager = { workspace = true }
+
+[dependency-groups]
+# Ferramentas de teste (não vão para produção). `uv sync --group test`.
+test = ["pytest>=8.0", "fakeredis[lua]>=2.21"]

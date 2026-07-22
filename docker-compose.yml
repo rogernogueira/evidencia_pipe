@@ -1,13 +1,21 @@
-# Infra de orquestração do evidencia_pipe: Redis (broker do Celery + job_store)
-# e Flower (monitor). MinerU, Qdrant e os workers Celery rodam fora deste compose
-# (no venv do host, por causa da GPU e dos modelos locais) — veja CELERY.md.
+# Infra de orquestração do evidencia_pipe: Redis (broker do Celery + job_store +
+# gpu_resource_manager) e Flower (monitor). MinerU, Qdrant e os workers Celery
+# rodam fora deste compose (no venv do host, por causa da GPU e dos modelos
+# locais) — veja CELERY.md.
+#
+# Um único Redis serve três DBs lógicos: DB 0 = broker Celery, DB 1 = job_store,
+# DB 2 = gpu_resource_manager (coordenação da GPU). MinerU, BGE-M3 e scripts
+# externos apontam todos para o MESMO Redis DB 2 (GPU_MANAGER_REDIS_URL) e o
+# MESMO GPU_RESOURCE_NAME para se coordenarem.
 services:
   redis:
     image: redis:7-alpine
     container_name: evidencia_redis
     command: ["redis-server", "--appendonly", "yes"]
+    # Exposto na loopback do host porque os workers de GPU e o MinerU rodam no
+    # host (não em contêiner). Restrito a 127.0.0.1 para não abrir na rede.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -31,5 +39,82 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Armazenamento OFICIAL dos artefatos do pipeline (S3-compatível). Versão FIXADA
+  # (nunca :latest). Bucket privado — sem acesso anônimo. A porta 9001 (console) só
+  # deve ser exposta para administração; não a exponha em produção sem necessidade.
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    container_name: evidencia_minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"        # API S3
+      - "9001:9001"        # Console (uso administrativo)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Inicialização idempotente do bucket: cria o bucket, mantém privado e habilita
+  # versionamento quando configurado. Roda uma vez e sai.
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    container_name: evidencia_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-evidencia-pipe}
+      MINIO_BUCKET_VERSIONING: ${MINIO_BUCKET_VERSIONING:-true}
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb --ignore-existing local/\"$$MINIO_BUCKET\";
+      mc anonymous set none local/\"$$MINIO_BUCKET\";
+      if [ \"$$MINIO_BUCKET_VERSIONING\" = \"true\" ]; then mc version enable local/\"$$MINIO_BUCKET\"; fi;
+      echo 'bucket pronto (privado, versionamento='$$MINIO_BUCKET_VERSIONING')';
+      "
+    restart: "no"
+
+  # Serviço de extração MinerU (estágio 2). Imagem construída de tmp/Dockerfile
+  # (base vllm/vllm-openai, mineru[core]>=3.4.0). REQUER GPU com acesso a TODAS as
+  # devices (--gpus all): com device único o vLLM falha com "Device string must not
+  # be empty". A porta 8011 evita conflito com serviços MinerU legados na 8010.
+  # Os workers no HOST apontam MINERU_API_URL=http://127.0.0.1:8011.
+  mineru:
+    build:
+      context: ./tmp
+    image: evidencia_mineru:local
+    container_name: evidencia_mineru
+    command: ["mineru-api", "--host", "0.0.0.0", "--port", "8010"]
+    environment:
+      MINERU_MODEL_SOURCE: local
+    ports:
+      - "8011:8010"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+
 volumes:
   redis_data:
+  minio_data:

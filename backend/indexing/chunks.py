@@ -3,6 +3,7 @@ import logging
 import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 from markdownify import markdownify as md_convert
 
@@ -248,6 +249,35 @@ class MinerUChunker:
             )
 
         return final_chunks
+
+
+# ---------------------------------------------------------------------------
+# Ponto de entrada / camada de compatibilidade (§5/§21).
+#
+# `chunks.py` permanece o módulo importado pelo pipeline. `get_chunker()` seleciona
+# a estratégia (structural_tokens por padrão, legacy_chars para comparação) e devolve
+# um objeto que implementa a interface comum `DocumentChunker` (backend.indexing.
+# chunk_models). O `MinerUChunker` acima continua disponível como implementação legada.
+# ---------------------------------------------------------------------------
+
+def get_chunker(strategy: Optional[str] = None):
+    """Fábrica do chunker ativo. `strategy` sobrepõe CHUNKING_STRATEGY.
+
+    Retorna um `DocumentChunker` (structural_tokens | legacy_chars). Importações
+    tardias evitam carregar o tokenizer/transformers quando este módulo é usado só
+    pelo caminho legado (MinerUChunker.process)."""
+    from backend.core import config as settings
+
+    strategy = (strategy or settings.CHUNKING_STRATEGY).strip().lower()
+    if strategy == "legacy_chars":
+        from backend.indexing.structural_token_chunker import LegacyCharacterChunker
+
+        return LegacyCharacterChunker()
+    if strategy == "structural_tokens":
+        from backend.indexing.structural_token_chunker import StructuralTokenChunker
+
+        return StructuralTokenChunker()
+    raise ValueError(f"CHUNKING_STRATEGY desconhecida: {strategy!r}")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,525 @@
+"""Normalização do documento MinerU em uma sequência ordenada de `DocumentBlock`.
+
+Prioridade de parsing (§7):
+    1. content_list_v2.json  → structure_source="mineru_json"
+    2. Markdown estruturado  → structure_source="markdown"
+    3. texto simples         → structure_source="plain_text"
+
+O JSON do MinerU (verificado em amostras reais deste repositório) é uma LISTA de
+páginas; cada página é uma lista de blocos `{type, content, bbox, sub_type?}`:
+
+    title             content.title_content[], content.level
+    paragraph         content.paragraph_content[]
+    list              content.list_type, content.list_items[].item_content[]
+    table             content.html, content.table_caption[], content.image_source.path
+    chart             content.content (md/texto), content.chart_caption[], image_source
+    image             content.image_source.path, content.content
+    equation_interline content.math_content, content.math_type
+    page_header/page_footer/page_number/page_footnote  content.<type>_content[]
+
+Inline: itens `{type:"text"|"equation_inline", content}`.
+
+Este módulo NÃO usa GPU. Cabeçalhos/rodapés repetidos e números de página isolados
+são detectados e removidos de forma rastreável (métricas), conforme §15.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Optional
+
+from backend.indexing.chunk_models import (
+    BLOCK_FIGURE_CAPTION,
+    BLOCK_FOOTER,
+    BLOCK_FOOTNOTE,
+    BLOCK_FORMULA,
+    BLOCK_HEADER,
+    BLOCK_HEADING,
+    BLOCK_LIST,
+    BLOCK_PAGE_NUMBER,
+    BLOCK_PARAGRAPH,
+    BLOCK_REFERENCE,
+    BLOCK_TABLE,
+    BLOCK_UNKNOWN,
+    DocumentBlock,
+    DocumentStructureParseError,
+)
+
+# Rótulos que iniciam a seção de referências bibliográficas (§16).
+_REFERENCES_HEADING_RE = re.compile(
+    r"^\s*(refer[êe]ncias?|bibliografia|references|obras\s+citadas)\b",
+    re.IGNORECASE,
+)
+
+# Header/footer é considerado "repetido" quando o MESMO texto normalizado aparece
+# em pelo menos este número de páginas (ou fração das páginas, o que for menor).
+_REPEAT_MIN_PAGES = 3
+_REPEAT_MIN_FRACTION = 0.5
+
+
+def _norm_ws(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _inline_to_text(items: Any) -> str:
+    """Concatena uma lista de itens inline `{type, content}` em texto plano.
+
+    equation_inline é preservado como `$latex$` (o BGE-M3 lida com isso melhor do
+    que descartar); text é usado como está."""
+    if not isinstance(items, list):
+        return ""
+    parts: list[str] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        content = it.get("content", "")
+        if not isinstance(content, str):
+            continue
+        if it.get("type") == "equation_inline":
+            content = content.strip()
+            parts.append(f"${content}$" if content else "")
+        else:
+            parts.append(content)
+    return "".join(parts).strip()
+
+
+class MinerUDocumentParser:
+    """Converte o content_list_v2.json (ou markdown) em `list[DocumentBlock]`.
+
+    Mantém a ordem original, a página, a hierarquia de títulos (`section_path`),
+    a origem do bloco (`source_reference`) e as coordenadas (`bbox`) quando houver.
+    """
+
+    def __init__(
+        self,
+        *,
+        remove_repeated_headers: bool = True,
+        remove_repeated_footers: bool = True,
+        keep_footnotes: bool = True,
+        images_base_uri: str = "",
+    ) -> None:
+        self.remove_repeated_headers = remove_repeated_headers
+        self.remove_repeated_footers = remove_repeated_footers
+        self.keep_footnotes = keep_footnotes
+        self.images_base_uri = images_base_uri.rstrip("/")
+        # Métricas preenchidas durante o parse (lidas pelo chunker).
+        self.removed_header_blocks = 0
+        self.removed_footer_blocks = 0
+        self.removed_page_number_blocks = 0
+        self.document_title: Optional[str] = None
+        self.warnings: list[str] = []
+
+    # -- API pública --------------------------------------------------------
+
+    def parse_json_file(self, path: Path) -> tuple[list[DocumentBlock], str]:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise DocumentStructureParseError(f"content_list inválido em '{path}': {exc}") from exc
+        return self.parse_json(data)
+
+    def parse_json(self, data: Any) -> tuple[list[DocumentBlock], str]:
+        """Parseia a estrutura MinerU. Retorna (blocos, structure_source)."""
+        if not isinstance(data, list):
+            raise DocumentStructureParseError("content_list MinerU deve ser uma lista.")
+        # Normaliza para lista-de-páginas: se vier lista plana de blocos, trata como 1 página.
+        pages = data if (data and isinstance(data[0], list)) else [data]
+
+        raw = self._flatten(pages)
+        raw = self._drop_repeated_furniture(raw)
+        blocks = self._assign_sections(raw)
+        return blocks, "mineru_json"
+
+    def parse_markdown(self, markdown: str) -> tuple[list[DocumentBlock], str]:
+        """Fallback (§7): parseia markdown estruturado (headings/parágrafos/listas/tabelas)."""
+        raw = self._parse_markdown_raw(markdown)
+        blocks = self._assign_sections(raw)
+        return blocks, "markdown"
+
+    def parse_plain_text(self, text: str) -> tuple[list[DocumentBlock], str]:
+        """Último recurso (§7): parágrafos separados por linha em branco."""
+        raw: list[dict] = []
+        for i, para in enumerate(re.split(r"\n\s*\n", text or "")):
+            para = para.strip()
+            if para:
+                raw.append({"type": BLOCK_PARAGRAPH, "text": para, "page": None,
+                            "level": None, "source": "plain_text"})
+        blocks = self._assign_sections(raw)
+        return blocks, "plain_text"
+
+    # -- extração de blocos MinerU -----------------------------------------
+
+    def _flatten(self, pages: list) -> list[dict]:
+        """Achata páginas → blocos "crus" (dicts intermediários), preservando ordem/página."""
+        out: list[dict] = []
+        for page_idx, page_blocks in enumerate(pages):
+            page_num = page_idx + 1
+            if not isinstance(page_blocks, list):
+                continue
+            for block in page_blocks:
+                if not isinstance(block, dict):
+                    continue
+                parsed = self._parse_block(block, page_num)
+                if parsed is not None:
+                    out.append(parsed)
+        return out
+
+    def _parse_block(self, block: dict, page_num: int) -> Optional[dict]:
+        b_type = block.get("type")
+        content = block.get("content")
+        bbox = block.get("bbox")
+        base = {"page": page_num, "bbox": bbox, "level": None, "source": f"mineru:{b_type}"}
+
+        if b_type == "title":
+            text = _inline_to_text((content or {}).get("title_content", []))
+            level = (content or {}).get("level")
+            if not text:
+                return None
+            if self.document_title is None:
+                self.document_title = text
+            return {**base, "type": BLOCK_HEADING, "text": text,
+                    "level": int(level) if isinstance(level, int) else 1}
+
+        if b_type == "paragraph":
+            text = _inline_to_text((content or {}).get("paragraph_content", []))
+            return {**base, "type": BLOCK_PARAGRAPH, "text": text} if text else None
+
+        if b_type == "list":
+            return self._parse_list(content, base)
+
+        if b_type == "table":
+            return self._parse_table(content, base)
+
+        if b_type == "chart":
+            return self._parse_chart(content, base)
+
+        if b_type == "image":
+            return self._parse_image(content, base)
+
+        if b_type == "equation_interline":
+            math = (content or {}).get("math_content", "")
+            math = math.strip() if isinstance(math, str) else ""
+            return {**base, "type": BLOCK_FORMULA, "text": f"$$ {math} $$"} if math else None
+
+        if b_type == "page_header":
+            text = _inline_to_text((content or {}).get("page_header_content", []))
+            return {**base, "type": BLOCK_HEADER, "text": text} if text else None
+
+        if b_type == "page_footer":
+            text = _inline_to_text((content or {}).get("page_footer_content", []))
+            return {**base, "type": BLOCK_FOOTER, "text": text} if text else None
+
+        if b_type == "page_number":
+            text = _inline_to_text((content or {}).get("page_number_content", []))
+            return {**base, "type": BLOCK_PAGE_NUMBER, "text": text} if text else None
+
+        if b_type == "page_footnote":
+            text = _inline_to_text((content or {}).get("page_footnote_content", []))
+            return {**base, "type": BLOCK_FOOTNOTE, "text": text} if text else None
+
+        # Tipo desconhecido: tenta extrair algum texto plano para não perder conteúdo.
+        text = self._best_effort_text(content)
+        return {**base, "type": BLOCK_UNKNOWN, "text": text} if text else None
+
+    def _parse_list(self, content: Any, base: dict) -> Optional[dict]:
+        content = content or {}
+        items = content.get("list_items", [])
+        list_type = content.get("list_type", "text_list")
+        ordered = "order" in str(list_type).lower() or list_type == "ordered_list"
+        lines: list[str] = []
+        for i, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            item_text = _inline_to_text(item.get("item_content", []))
+            if not item_text:
+                continue
+            marker = f"{i}." if ordered else "-"
+            lines.append(f"{marker} {item_text}")
+        if not lines:
+            return None
+        return {
+            **base, "type": BLOCK_LIST, "text": "\n".join(lines),
+            "meta": {
+                "list_type": "ordered" if ordered else "unordered",
+                "list_start_index": 1,
+                "list_end_index": len(lines),
+                "item_count": len(lines),
+            },
+        }
+
+    def _parse_table(self, content: Any, base: dict) -> Optional[dict]:
+        content = content or {}
+        html = content.get("html", "")
+        caption = _inline_to_text(content.get("table_caption", []))
+        footnote = _inline_to_text(content.get("table_footnote", []))
+        table_md = self._html_table_to_markdown(html)
+        parts = []
+        if caption:
+            parts.append(caption)
+        if table_md:
+            parts.append(table_md)
+        if footnote:
+            parts.append(f"Fonte: {footnote}")
+        text = "\n".join(parts).strip()
+        if not text:
+            return None
+        img_path = ((content.get("image_source") or {}).get("path") or "")
+        return {
+            **base, "type": BLOCK_TABLE, "text": text,
+            "meta": {
+                "table_caption": caption or None,
+                "table_type": content.get("table_type"),
+                "table_markdown": table_md,
+                "image_uri": self._image_uri(img_path),
+            },
+        }
+
+    def _parse_chart(self, content: Any, base: dict) -> Optional[dict]:
+        content = content or {}
+        caption = _inline_to_text(content.get("chart_caption", []))
+        footnote = _inline_to_text(content.get("chart_footnote", []))
+        body = content.get("content", "")
+        body = body.strip() if isinstance(body, str) else ""
+        # Charts frequentemente trazem uma tabela markdown em `content` → tratamos
+        # como tabela (dados reais). Sem corpo tabular, vira legenda de figura.
+        looks_tabular = "|" in body and "---" in body
+        parts = [p for p in (caption, body, (f"Fonte: {footnote}" if footnote else "")) if p]
+        text = "\n".join(parts).strip()
+        if not text:
+            return None
+        img_path = ((content.get("image_source") or {}).get("path") or "")
+        return {
+            **base,
+            "type": BLOCK_TABLE if looks_tabular else BLOCK_FIGURE_CAPTION,
+            "text": text,
+            "meta": {
+                "table_caption": caption or None,
+                "figure_caption": caption or None,
+                "table_markdown": body if looks_tabular else None,
+                "image_uri": self._image_uri(img_path),
+                "origin": "chart",
+            },
+        }
+
+    def _parse_image(self, content: Any, base: dict) -> Optional[dict]:
+        content = content or {}
+        desc = content.get("content", "")
+        desc = desc.strip() if isinstance(desc, str) else ""
+        img_path = ((content.get("image_source") or {}).get("path") or "")
+        # Não incluímos bytes/base64 (§14) — só a descrição textual e a URI da imagem.
+        text = desc or (Path(img_path).name if img_path else "")
+        if not text:
+            return None
+        return {
+            **base, "type": BLOCK_FIGURE_CAPTION, "text": text,
+            "meta": {"image_uri": self._image_uri(img_path), "origin": "image"},
+        }
+
+    def _image_uri(self, path: str) -> Optional[str]:
+        if not path:
+            return None
+        if self.images_base_uri:
+            return f"{self.images_base_uri}/{Path(path).name}"
+        return path
+
+    @staticmethod
+    def _best_effort_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, dict):
+            for key in ("content", "text"):
+                v = content.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            # tenta qualquer *_content lista de inline
+            for k, v in content.items():
+                if k.endswith("_content") and isinstance(v, list):
+                    t = _inline_to_text(v)
+                    if t:
+                        return t
+        return ""
+
+    @staticmethod
+    def _html_table_to_markdown(html: str) -> str:
+        if not html:
+            return ""
+        try:
+            from markdownify import markdownify as md_convert
+
+            return md_convert(html, heading_style="ATX").strip()
+        except Exception:
+            # Sem markdownify (não deveria acontecer — é dependência): remove tags.
+            return _norm_ws(re.sub(r"<[^>]+>", " ", html))
+
+    # -- remoção de header/footer/page_number repetidos (§15) --------------
+
+    def _drop_repeated_furniture(self, raw: list[dict]) -> list[dict]:
+        total_pages = len({b["page"] for b in raw if b.get("page")}) or 1
+        threshold = min(_REPEAT_MIN_PAGES, max(2, int(total_pages * _REPEAT_MIN_FRACTION)))
+
+        def repeated_keys(block_type: str) -> set[str]:
+            # conta em quantas PÁGINAS distintas cada texto normalizado aparece
+            per_key_pages: dict[str, set[int]] = {}
+            for b in raw:
+                if b["type"] == block_type:
+                    key = _norm_ws(b["text"]).lower()
+                    per_key_pages.setdefault(key, set()).add(b.get("page") or 0)
+            return {k for k, pages in per_key_pages.items() if len(pages) >= threshold}
+
+        rep_headers = repeated_keys(BLOCK_HEADER) if self.remove_repeated_headers else set()
+        rep_footers = repeated_keys(BLOCK_FOOTER) if self.remove_repeated_footers else set()
+
+        kept: list[dict] = []
+        for b in raw:
+            t = b["type"]
+            key = _norm_ws(b["text"]).lower()
+            # Números de página isolados são sempre ruído estrutural (§15).
+            if t == BLOCK_PAGE_NUMBER:
+                self.removed_page_number_blocks += 1
+                continue
+            # Cabeçalhos/rodapés RECORRENTES: removidos (rastreado). Os não recorrentes
+            # são mantidos como blocos-furniture (o chunker só consome BODY_BLOCK_TYPES,
+            # então não poluem os chunks, mas permanecem auditáveis no parse).
+            if t == BLOCK_HEADER and key in rep_headers:
+                self.removed_header_blocks += 1
+                continue
+            if t == BLOCK_FOOTER and key in rep_footers:
+                self.removed_footer_blocks += 1
+                continue
+            if t == BLOCK_FOOTNOTE and not self.keep_footnotes:
+                continue
+            kept.append(b)
+        return kept
+
+    # -- atribuição de seção + materialização em DocumentBlock -------------
+
+    def _assign_sections(self, raw: list[dict]) -> list[DocumentBlock]:
+        blocks: list[DocumentBlock] = []
+        stack: list[tuple[int, str]] = []  # (heading_level, title)
+        in_references = False
+
+        for order_index, b in enumerate(raw):
+            b_type = b["type"]
+            text = (b.get("text") or "").strip()
+            if not text:
+                continue
+
+            if b_type == BLOCK_HEADING:
+                level = b.get("level") or 1
+                is_ref = bool(_REFERENCES_HEADING_RE.match(text))
+                in_references = is_ref
+                # atualiza a pilha hierárquica
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+                stack.append((level, text))
+                section_path = [t for _, t in stack]
+                blocks.append(self._mk_block(order_index, BLOCK_HEADING, text, b,
+                                             section_path, heading_level=level))
+                continue
+
+            effective_type = b_type
+            if in_references and b_type in (BLOCK_PARAGRAPH, BLOCK_LIST):
+                effective_type = BLOCK_REFERENCE
+
+            section_path = [t for _, t in stack]
+            blocks.append(self._mk_block(order_index, effective_type, text, b, section_path))
+        return blocks
+
+    def _mk_block(
+        self, order_index: int, block_type: str, text: str, raw: dict,
+        section_path: list[str], *, heading_level: Optional[int] = None,
+    ) -> DocumentBlock:
+        return DocumentBlock(
+            block_id=f"block-{order_index:04d}",
+            block_type=block_type,
+            text=text,
+            order_index=order_index,
+            page_number=raw.get("page"),
+            heading_level=heading_level,
+            section_path=section_path,
+            bbox=[float(x) for x in raw["bbox"]] if isinstance(raw.get("bbox"), list) else None,
+            source_reference=raw.get("source"),
+            metadata=raw.get("meta", {}) or {},
+        )
+
+    # -- markdown fallback --------------------------------------------------
+
+    def _parse_markdown_raw(self, markdown: str) -> list[dict]:
+        raw: list[dict] = []
+        lines = (markdown or "").splitlines()
+        i = 0
+        n = len(lines)
+        para: list[str] = []
+        list_buf: list[str] = []
+
+        def flush_para():
+            if para:
+                text = _norm_ws(" ".join(para))
+                if text:
+                    raw.append({"type": BLOCK_PARAGRAPH, "text": text, "page": None,
+                                "level": None, "source": "markdown", "bbox": None})
+                para.clear()
+
+        def flush_list():
+            if list_buf:
+                raw.append({"type": BLOCK_LIST, "text": "\n".join(list_buf), "page": None,
+                            "level": None, "source": "markdown", "bbox": None,
+                            "meta": {"list_type": "unordered", "list_start_index": 1,
+                                     "list_end_index": len(list_buf), "item_count": len(list_buf)}})
+                list_buf.clear()
+
+        while i < n:
+            line = lines[i].rstrip()
+            stripped = line.strip()
+            heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            table_row = "|" in stripped and stripped.count("|") >= 2
+            list_item = re.match(r"^([-*+]|\d+[.)])\s+(.+)$", stripped)
+
+            if heading:
+                flush_para()
+                flush_list()
+                level = len(heading.group(1))
+                raw.append({"type": BLOCK_HEADING, "text": heading.group(2).strip(),
+                            "page": None, "level": level, "source": "markdown", "bbox": None})
+                i += 1
+                continue
+
+            if table_row:
+                flush_para()
+                flush_list()
+                tbl: list[str] = []
+                while i < n and "|" in lines[i]:
+                    tbl.append(lines[i].strip())
+                    i += 1
+                raw.append({"type": BLOCK_TABLE, "text": "\n".join(tbl), "page": None,
+                            "level": None, "source": "markdown", "bbox": None,
+                            "meta": {"table_markdown": "\n".join(tbl)}})
+                continue
+
+            if list_item:
+                flush_para()
+                list_buf.append(f"- {list_item.group(2).strip()}")
+                i += 1
+                continue
+
+            if not stripped:
+                flush_para()
+                flush_list()
+                i += 1
+                continue
+
+            flush_list()
+            para.append(stripped)
+            i += 1
+
+        flush_para()
+        flush_list()
+        # define document_title = primeiro heading, se houver
+        if self.document_title is None:
+            for b in raw:
+                if b["type"] == BLOCK_HEADING:
+                    self.document_title = b["text"]
+                    break
+        return raw

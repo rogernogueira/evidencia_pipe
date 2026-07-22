@@ -1,13 +1,9 @@
 import csv
-from pathlib import Path
 import traceback
+from pathlib import Path
 
-from backend.core.config import OUTPUT_DIR
 from backend.core.logger import log
-from backend.services.mineru_service import process_pdf
-from backend.services.job_store import set_status, find_markdown, markdown_url
-from backend.services import llm_enrich_service as llm_enrich
-from backend.indexing.index_chunks import index_single_document
+from backend.services.job_store import set_status
 
 LOG_PROCESS_FILE = Path("relatorio_processamento.csv")
 LOG_EMBED_FILE = Path("relatorio_embeddings.csv")
@@ -40,71 +36,51 @@ def write_embed_log(result: dict):
         writer.writerow(result)
 
 def run_pdf_pipeline(pdf_path: Path, item_uuid: str = "", item_handle: str = ""):
-    """
-    Worker job executado em background para processar o PDF inteiro
-    e indexá-lo no Qdrant sem travar o endpoint.
+    """Fluxo LEGADO (síncrono, em background) — agora usando o MESMO MinIO das tasks
+    Celery, para não manter duas fontes de artefatos (§42).
 
-    item_uuid/item_handle (ingestão a partir de um item DSpace) são propagados
-    aos chunks do Qdrant e ao metadata da LLM.
+    O PDF já existe localmente; ele é gravado como source_pdf no MinIO e as etapas
+    2-4 reutilizam exatamente a lógica de backend/services/pipeline_stages.py
+    (MinerU → enrich → index), com os artefatos indo ao MinIO e o manifesto sendo a
+    fonte de descoberta. A coordenação de GPU continua sendo feita próximo ao recurso
+    (process_pdf e embedder), sem lock aninhado.
     """
+    # Import tardio: evita puxar o SDK do MinIO em contextos que só usam os CSVs.
+    from backend.services import pipeline_stages as stages
+
+    pdf_path = Path(pdf_path)
     job_id = pdf_path.stem
-    log.info("Pipeline Background Iniciado: %s", pdf_path.name)
+    log.info("Pipeline Background (legado→MinIO) Iniciado: %s", pdf_path.name)
     set_status(job_id, "processando", filename=pdf_path.name)
     try:
-        # 1. Extração via MinerU
-        proc_result = process_pdf(pdf_path, OUTPUT_DIR)
-        write_process_log(proc_result)
+        ctx = stages.stage_ingest_local_pdf(pdf_path, item_uuid=item_uuid, item_handle=item_handle)
+        set_status(job_id, "processando", stage="download",
+                   pipeline_id=str(ctx.pipeline_id), document_id=ctx.document_id,
+                   artifact_manifest_uri=ctx.artifact_manifest_uri)
 
-        if proc_result["status"] != "Sucesso":
-            log.error("Pipeline abortado para %s: Falha no MinerU.", pdf_path.name)
-            set_status(job_id, "erro", error="Falha na extração do MinerU")
-            return
+        # 2. Extração MinerU → MinIO
+        set_status(job_id, "processando", stage="mineru")
+        ctx = stages.stage_mineru(ctx)
 
-        # 2. Busca pelo JSON recém-criado (fica em <basename>/<método>/, ex: hybrid_auto/)
-        json_matches = list((OUTPUT_DIR / job_id).rglob(f"{job_id}_content_list_v2.json"))
-
-        if not json_matches:
-            log.warning("JSON de conteúdo não encontrado em: %s", OUTPUT_DIR / job_id)
-            set_status(job_id, "erro", error="JSON de conteúdo não encontrado após extração")
-            return
-        json_path = json_matches[0]
-
-        # MD pronto a partir daqui — a indexação é best-effort (não invalida o MD)
-        md_path = find_markdown(job_id)
-        md_url = markdown_url(md_path) if md_path else None
-
-        # 3. Enriquecimento de metadados por LLM (DeepSeek) — best-effort.
-        # Quando disponível, roda antes da indexação para que os chunks recebam
-        # no payload os metadados derivados da análise do documento.
-        if llm_enrich.is_available():
-            try:
-                log.info("Iniciando enriquecimento por LLM para: %s", job_id)
-                meta = llm_enrich.enrich_job(job_id, uuid=item_uuid)
-                set_status(
-                    job_id, "processando", md_url=md_url,
-                    metadata_json=meta.arquivo_json, metadata_revisar=meta.revisar,
-                )
-            except Exception as llm_exc:
-                log.error("Enriquecimento LLM falhou para %s: %s", job_id, llm_exc)
-                log.error(traceback.format_exc())
-                set_status(job_id, "processando", md_url=md_url, llm_error=str(llm_exc))
-
-        # 4. Indexação e Embedding (Qdrant)
+        # 3. Indexação/embedding → Qdrant (best-effort quanto ao índice). A indexação
+        # é DESACOPLADA do LLM: roda ANTES do enrich e não depende dele.
+        set_status(job_id, "processando", stage="index")
         try:
-            log.info("Iniciando indexação (chunking/embedding) para: %s", json_path.name)
-            embed_result = index_single_document(json_path, item_uuid=item_uuid, item_handle=item_handle)
-            write_embed_log(embed_result)
-            set_status(
-                job_id,
-                "concluido",
-                md_url=md_url,
-                n_chunks=embed_result.get("n_chunks") if isinstance(embed_result, dict) else None,
-            )
+            summary = stages.stage_index(ctx)
+            set_status(job_id, "concluido", stage="index",
+                       n_chunks=summary.get("chunk_count"),
+                       indexed_count=summary.get("indexed_count"))
             log.info("Pipeline Background Concluído para: %s", pdf_path.name)
         except Exception as idx_exc:
             log.error("Indexação falhou para %s: %s", pdf_path.name, idx_exc)
             log.error(traceback.format_exc())
-            set_status(job_id, "concluido", md_url=md_url, index_error=str(idx_exc))
+            set_status(job_id, "concluido", stage="index", index_error=str(idx_exc))
+
+        # 4. Enriquecimento por LLM (best-effort, DESACOPLADO) → MinIO. Roda APÓS a
+        # indexação e propaga os metadados ao Qdrant (set_payload). Sem provedor
+        # configurado é no-op; falhas aqui não afetam o índice já concluído.
+        set_status(job_id, "processando", stage="llm")
+        ctx = stages.stage_enrich(ctx)
 
     except Exception as e:
         log.error("Pipeline Background falhou criticamente: %s", e)

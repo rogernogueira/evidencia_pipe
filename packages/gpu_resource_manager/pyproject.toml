@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpu-resource-manager"
+version = "0.1.0"
+description = "Coordenação distribuída (mutex + fila com prioridade/aging + lease/heartbeat) de recursos de GPU sobre Redis. Independente de Celery/FastAPI/PyTorch."
+readme = "README.md"
+# 3.11+ para ser reutilizável fora do evidencia_pipe (que exige 3.13).
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "evidencia_pipe" }]
+keywords = ["gpu", "redis", "lock", "lease", "queue", "priority", "cuda"]
+dependencies = [
+    # Única dependência de runtime: cliente Redis. Sem Celery/FastAPI/PyTorch/Qdrant.
+    "redis>=5.0",
+]
+
+[project.optional-dependencies]
+# Integração Prometheus opcional — NÃO é dependência obrigatória (ver metrics_prometheus.py).
+prometheus = ["prometheus-client>=0.20"]
+test = ["pytest>=8.0", "fakeredis>=2.21"]
+
+[project.scripts]
+gpu-manager = "gpu_resource_manager.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpu_resource_manager"]
