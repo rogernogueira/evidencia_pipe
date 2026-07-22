@@ -11,6 +11,34 @@ from backend.core.config import DENSE_MODEL
 from backend.core.logger import log
 
 _SHARED_MODEL: Optional[BGEM3FlagModel] = None
+# Instância CPU residente (fp32), usada no modo cpu e no fallback do modo auto. Fica
+# separada do _SHARED_MODEL (GPU) para não flipar um único modelo entre devices — o
+# que é frágil na API nova do FlagEmbedding. Só é criada quando realmente usada.
+_CPU_MODEL: Optional[BGEM3FlagModel] = None
+
+# Exceções que sinalizam "GPU indisponível" → gatilho de fallback para CPU (modo auto).
+try:  # pragma: no cover - depende do pacote gpu_resource_manager
+    from gpu_resource_manager.exceptions import GPUAcquisitionTimeout, GPUBackendUnavailable
+    _GPU_UNAVAILABLE_ERRORS: tuple = (GPUAcquisitionTimeout, GPUBackendUnavailable)
+except Exception:  # pragma: no cover
+    _GPU_UNAVAILABLE_ERRORS = ()
+
+
+def _get_cpu_model() -> BGEM3FlagModel:
+    """Carrega (uma vez) o bge-m3 em CPU, fp32. Residente em RAM (~2,3 GB); não toca
+    a VRAM nem o lock da GPU."""
+    global _CPU_MODEL
+    if _CPU_MODEL is None:
+        log.info("Carregando bge-m3 em CPU (fp32) — modo/fallback CPU…")
+        _CPU_MODEL = BGEM3FlagModel(DENSE_MODEL, use_fp16=False, devices=["cpu"])
+        log.info("bge-m3 (CPU) pronto.")
+    return _CPU_MODEL
+
+
+def _encode_docs(model: BGEM3FlagModel, texts: List[str], batch_size: int):
+    enc = model.encode(texts, batch_size=batch_size, return_dense=True,
+                       return_sparse=True, return_colbert_vecs=False)
+    return [v.tolist() for v in enc["dense_vecs"]], enc["lexical_weights"]
 
 
 @contextmanager
@@ -19,6 +47,7 @@ def _gpu_session(
     task_id: Optional[str] = None,
     document_id: Optional[str] = None,
     metadata: Optional[dict] = None,
+    wait_timeout: Optional[float] = None,
 ) -> Iterator[Any]:
     """Adquire o recurso de GPU (via gpu_resource_manager) SOMENTE ao redor do
     trabalho CUDA do BGE-M3: move o modelo para a GPU, roda a inferência, e antes
@@ -48,6 +77,7 @@ def _gpu_session(
         task_id=task_id,
         document_id=document_id,
         metadata={"operation": "dense-sparse-embedding", **(metadata or {})},
+        wait_timeout_seconds=wait_timeout,
     ) as lease:
         model_manager.move_to_gpu()
         try:
@@ -149,21 +179,28 @@ class BgeM3EmbedderService:
 
         text = fold_accents(query) if normalize else query
 
-        # Inferência CUDA sob o lock da GPU. O _gpu_session garante o modelo carregado
-        # (move_to_gpu → ensure_loaded); a checagem vem DEPOIS de entrar na sessão
-        # (o modelo pode ter sido descarregado após a task anterior).
-        with _gpu_session(metadata={"operation": "query-embedding"}):
-            if not self._model:
-                raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
-            encoded = self._model.encode(
-                [text],
-                batch_size=1,
-                return_dense=True,
-                return_sparse=True,
-                return_colbert_vecs=False,
-            )
-            dense_vector = encoded["dense_vecs"][0].tolist()
-            lexical_weights = encoded["lexical_weights"][0]
+        def _q(model):
+            enc = model.encode([text], batch_size=1, return_dense=True,
+                               return_sparse=True, return_colbert_vecs=False)
+            return enc["dense_vecs"][0].tolist(), enc["lexical_weights"][0]
+
+        mode = settings.EMBED_DEVICE
+        if mode == "cpu":
+            dense_vector, lexical_weights = _q(_get_cpu_model())
+        else:
+            wait = None if mode == "gpu" else float(settings.EMBED_GPU_ACQUIRE_TIMEOUT)
+            try:
+                # _gpu_session garante o modelo carregado/na GPU (move_to_gpu →
+                # ensure_loaded); a checagem vem DEPOIS de entrar na sessão.
+                with _gpu_session(metadata={"operation": "query-embedding"}, wait_timeout=wait):
+                    if not self._model:
+                        raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
+                    dense_vector, lexical_weights = _q(self._model)
+            except _GPU_UNAVAILABLE_ERRORS as exc:
+                if mode == "gpu":
+                    raise
+                log.warning("[embed] GPU indisponível (%s) — query em CPU.", type(exc).__name__)
+                dense_vector, lexical_weights = _q(_get_cpu_model())
 
         _QUERY_CACHE[cache_key] = (dense_vector, lexical_weights)
         if len(_QUERY_CACHE) > _QUERY_CACHE_MAX:
@@ -182,9 +219,10 @@ class BgeM3EmbedderService:
     ) -> Tuple[List[List[float]], List[Dict[str, float]]]:
         """Gera embeddings em batch para múltiplos documentos.
 
-        A inferência CUDA (dense + sparse) roda sob o lock da GPU; o preparo dos
-        textos (fold de acentos) fica FORA do lock. task_id/document_id são
-        propagados ao gpu_resource_manager como metadados de diagnóstico.
+        Device (EMBED_DEVICE): `gpu` roda sob o lock (espera cheia); `cpu` roda em CPU
+        sem lock; `auto` (padrão) tenta a GPU com timeout curto e, se o lock não vier
+        (MinerU ocupando o gpu0), cai para CPU — assim o índice nunca é "starved". O
+        preparo (fold de acentos) fica sempre FORA do lock.
 
         Args:
             normalize: Se True, remove acentos (unidecode) antes de embeddar. Deve casar
@@ -197,31 +235,32 @@ class BgeM3EmbedderService:
         if normalize:
             texts = [fold_accents(t) for t in texts]
 
-        # Inferência + transferência dos resultados para CPU DENTRO do lock. O
-        # _gpu_session carrega/reposiciona o modelo (move_to_gpu → ensure_loaded);
-        # por isso a checagem de "carregado" vem DEPOIS de entrar na sessão — o
-        # modelo pode ter sido descarregado após a task anterior
-        # (BGE_UNLOAD_AFTER_TASK) e é aqui que ele volta.
-        with _gpu_session(
-            task_id=task_id,
-            document_id=document_id,
-            metadata={"batch_count": len(texts), "batch_size": batch_size},
-        ):
-            if not self._model:
-                raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
-            encoded = self._model.encode(
-                texts,
-                batch_size=batch_size,
-                return_dense=True,
-                return_sparse=True,
-                return_colbert_vecs=False,
-            )
-            # Dense vecs já vêm como numpy array (CPU); converter aqui é a
-            # "transferência dos resultados para CPU" antes de soltar o lease.
-            dense_vecs = [v.tolist() for v in encoded["dense_vecs"]]
-            lexical_list = encoded["lexical_weights"]
+        mode = settings.EMBED_DEVICE
+        if mode == "cpu":
+            log.info("[embed] CPU (device=cpu): %d chunk(s) doc=%s", len(texts), document_id)
+            return _encode_docs(_get_cpu_model(), texts, batch_size)
 
-        return dense_vecs, lexical_list
+        # gpu | auto — tenta a GPU. Em auto, timeout curto → fallback CPU.
+        wait = None if mode == "gpu" else float(settings.EMBED_GPU_ACQUIRE_TIMEOUT)
+        try:
+            # _gpu_session carrega/reposiciona o modelo (move_to_gpu → ensure_loaded);
+            # a checagem de "carregado" vem DEPOIS de entrar na sessão (o modelo pode
+            # ter sido descarregado após a task anterior — BGE_UNLOAD_AFTER_TASK).
+            with _gpu_session(
+                task_id=task_id,
+                document_id=document_id,
+                metadata={"batch_count": len(texts), "batch_size": batch_size},
+                wait_timeout=wait,
+            ):
+                if not self._model:
+                    raise RuntimeError("O modelo bge-m3 não foi carregado. Chame load_model() primeiro.")
+                return _encode_docs(self._model, texts, batch_size)
+        except _GPU_UNAVAILABLE_ERRORS as exc:
+            if mode == "gpu":
+                raise  # modo estrito: propaga (comportamento original)
+            log.warning("[embed] GPU indisponível (%s) — fallback CPU para doc=%s (%d chunks).",
+                        type(exc).__name__, document_id, len(texts))
+            return _encode_docs(_get_cpu_model(), texts, batch_size)
         
     def get_dense_dimension(self) -> int:
         """Sonda o modelo para descobrir a dimensão real do vetor denso."""

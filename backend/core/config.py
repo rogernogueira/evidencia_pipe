@@ -69,6 +69,20 @@ BGE_GPU_LIFECYCLE = os.getenv("BGE_GPU_LIFECYCLE", "lazy").strip().lower()
 BGE_UNLOAD_AFTER_TASK = os.getenv("BGE_UNLOAD_AFTER_TASK", "true").strip().lower() in {"1", "true", "yes", "on"}
 GPU_SHARED_WITH_MINERU = os.getenv("GPU_SHARED_WITH_MINERU", "true").strip().lower() in {"1", "true", "yes", "on"}
 
+# Device do embedding bge-m3:
+#   auto (padrão) — tenta a GPU com timeout curto; se o lock não vier a tempo (MinerU
+#                   ocupando o gpu0), cai para CPU (fp32, sem lock) e NÃO trava o índice.
+#   gpu           — sempre GPU (espera o wait_timeout cheio; comportamento estrito).
+#   cpu           — sempre CPU (nunca toca a GPU).
+# A CPU roda em paralelo ao MinerU e elimina a contenção do índice; o embedding é barato,
+# então a lentidão da CPU é aceitável (roda concorrente, não bloqueia). fp32 em CPU;
+# embeddings CPU(fp32) e GPU(fp16) são intercambiáveis na mesma collection (Δ ~1e-3).
+EMBED_DEVICE = os.getenv("EMBED_DEVICE", "auto").strip().lower()
+if EMBED_DEVICE not in {"auto", "gpu", "cpu"}:
+    EMBED_DEVICE = "auto"
+# No modo auto: segundos a esperar pelo lock da GPU antes de cair para CPU.
+EMBED_GPU_ACQUIRE_TIMEOUT = int(os.getenv("EMBED_GPU_ACQUIRE_TIMEOUT", "45"))
+
 # Enriquecimento de metadados por LLM (llm_enrich_service) — DESACOPLADO do
 # provedor e da indexação. Qualquer endpoint OpenAI-compatible serve; o provedor
 # é apenas um conjunto de defaults (base_url/model). Sem chave, o enrich é pulado
