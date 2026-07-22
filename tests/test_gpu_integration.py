@@ -141,7 +141,8 @@ def test_external_priority_runs_before_bge_and_does_not_preempt_mineru(gpu_manag
 
     t_bge = threading.Thread(target=_run, args=(bge, "bge-m3", settings.BGE_GPU_PRIORITY, 0.1, order, 0.1), daemon=True)
     t_ext = threading.Thread(target=_run, args=(ext, "ext", 10, 0.1, order, 0.25), daemon=True)
-    t_bge.start(); t_ext.start()
+    t_bge.start()
+    t_ext.start()
     time.sleep(0.5)
 
     # não-preempção: mineru ainda é o dono
@@ -149,7 +150,8 @@ def test_external_priority_runs_before_bge_and_does_not_preempt_mineru(gpu_manag
     order.append(("end", "mineru", time.time()))
     mineru_lease.release()
 
-    t_bge.join(timeout=5); t_ext.join(timeout=5)
+    t_bge.join(timeout=5)
+    t_ext.join(timeout=5)
 
     # sem sobreposição
     iv = {}

@@ -67,7 +67,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setattr(mineru, "process_pdf", fake_process)
 
     # CSVs: no-op.
-    import backend.services.pipeline_worker as pw
+    import backend.services.report_logs as pw
 
     monkeypatch.setattr(pw, "write_process_log", lambda r: None)
     monkeypatch.setattr(pw, "write_embed_log", lambda r: None)

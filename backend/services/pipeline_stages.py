@@ -1,9 +1,8 @@
-"""Lógica reutilizável das 4 etapas do pipeline (download → MinerU → enrich → index).
+"""Lógica das etapas do pipeline (download → MinerU → índice; enrich desacoplado).
 
 Estas funções são PURAS em relação ao Celery: recebem/retornam um PipelineContext
 leve e falam apenas com o ArtifactStore (MinIO) e o ManifestRepository. São usadas
-tanto pelas tasks Celery (backend/tasks.py) quanto pelo fluxo legado
-(backend/services/pipeline_worker.py), garantindo UMA fonte oficial de artefatos.
+pelas tasks Celery (backend/tasks.py), garantindo UMA fonte oficial de artefatos.
 
 Contrato de cada etapa:
   1. abre o manifesto no MinIO (ou o cria, no download);
@@ -181,39 +180,6 @@ def stage_download(
                     CTX_STAGE_DOWNLOADED, force)
 
 
-def stage_ingest_local_pdf(
-    pdf_path: Path, *, item_uuid: str = "", item_handle: str = "", force: bool = False,
-) -> PipelineContext:
-    """Variante do download para o fluxo LEGADO (pipeline_worker): o PDF já existe
-    localmente; grava-o como source_pdf no MinIO e cria/atualiza o manifesto. Assim
-    o MinIO permanece a fonte oficial (sem segunda fonte de artefatos, §42)."""
-    store = get_artifact_store()
-    repo = get_manifest_repository()
-    pdf_path = Path(pdf_path)
-    job_id = pdf_path.stem
-    document_id = sanitize_component(job_id, field="job_id")
-    pipeline_id = _derive_pipeline_id(item_uuid, None, document_id)
-    repo.create(pipeline_id=pipeline_id, job_id=job_id, document_id=document_id, item_uuid=item_uuid)
-    manifest_uri = repo.manifest_uri(pipeline_id, document_id)
-    src_key = store.artifact_key(pipeline_id, document_id, "source", "original.pdf")
-
-    repo.start_stage(pipeline_id, document_id, STAGE_DOWNLOAD)
-    ref = store.put_file(
-        src_key, pdf_path, content_type="application/pdf", name=ART_SOURCE_PDF,
-        metadata=_artifact_metadata(pipeline_id=pipeline_id, document_id=document_id,
-                                    job_id=job_id, artifact_name=ART_SOURCE_PDF, stage=STAGE_DOWNLOAD),
-    )
-    with repo.update(pipeline_id, document_id) as m:
-        m.item_handle = item_handle or m.item_handle
-        m.artifacts[ART_SOURCE_PDF] = ref
-        st = m.stage(STAGE_DOWNLOAD)
-        st.status = "COMPLETED"
-        st.completed_at = _now()
-        m.status = "RUNNING"
-    return _context(pipeline_id, job_id, document_id, item_uuid, None, manifest_uri,
-                    CTX_STAGE_DOWNLOADED, force)
-
-
 # ==========================================================================
 # Etapa 2 — extração MinerU (usa arquivo local; produtos vão ao MinIO)
 # ==========================================================================
@@ -296,7 +262,7 @@ def stage_mineru(ctx: PipelineContext, *, task_id: str | None = None) -> Pipelin
 
         proc_result = process_pdf(pdf_local, out_dir, task_id=task_id, document_id=document_id)
         try:
-            from backend.services.pipeline_worker import write_process_log
+            from backend.services.report_logs import write_process_log
 
             write_process_log(proc_result)
         except Exception as exc:  # CSV é best-effort
@@ -497,7 +463,7 @@ def stage_index(ctx: PipelineContext, *, task_id: str | None = None) -> dict:
             upsert_batch_size=settings.QDRANT_UPSERT_BATCH_SIZE,
         )
         try:
-            from backend.services.pipeline_worker import write_embed_log
+            from backend.services.report_logs import write_embed_log
 
             write_embed_log(result)
         except Exception as exc:
