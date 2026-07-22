@@ -47,10 +47,21 @@ GPU_MANAGER_ENABLED = os.getenv("GPU_MANAGER_ENABLED", "true").strip().lower() i
 GPU_MANAGER_REDIS_URL = os.getenv("GPU_MANAGER_REDIS_URL", f"{REDIS_URL}/2")
 GPU_RESOURCE_NAME = os.getenv("GPU_RESOURCE_NAME", "gpu0")
 
-# Prioridades dos consumidores internos (menor número = maior prioridade).
-# A biblioteca NÃO conhece "mineru"/"bge-m3"; os nomes/prioridades vivem aqui.
+# Prioridades dos consumidores internos (menor número = maior prioridade; a fila é
+# ordenada ascendente por effective_priority). A biblioteca NÃO conhece
+# "mineru"/"bge-m3"; os nomes/prioridades vivem aqui.
+#
+# Esquema (do mais prioritário ao menos): externo/interativo (10) < índice bge-m3 (15)
+# < extração MinerU (20). O ÍNDICE (bge-m3) é MAIS prioritário que a EXTRAÇÃO de
+# propósito: sob lote grande, o MinerU (longo) gera um backlog que, se tivesse
+# prioridade maior, faria o índice (rápido) ser "starved" — foi o que ocorreu no teste
+# de 64 (3 jobs estouraram o wait_timeout de 1800s esperando a GPU). Dando ao índice
+# prioridade acima da extração, cada doc extraído é indexado logo (drena o pipeline);
+# não há preempção, então a extração em andamento nunca é interrompida — só a ORDEM da
+# fila de espera muda. Aging (−1 a cada 5 min) sozinho não resolvia: em 30 min o bge-m3
+# só cairia de 30→24, sem alcançar o 20 do MinerU.
 MINERU_GPU_PRIORITY = int(os.getenv("MINERU_GPU_PRIORITY", "20"))
-BGE_GPU_PRIORITY = int(os.getenv("BGE_GPU_PRIORITY", "30"))
+BGE_GPU_PRIORITY = int(os.getenv("BGE_GPU_PRIORITY", "15"))
 
 # Ciclo de vida do BGE-M3 na VRAM (ver backend/services/bge_model_manager.py).
 #   preload | lazy | cpu_idle | unload   — padrão p/ GPU compartilhada: lazy.
