@@ -115,6 +115,37 @@ services:
       start_period: 180s
     restart: unless-stopped
 
+  # Variante SÓ-PIPELINE do MinerU: --enable-vlm-preload false → NÃO carrega o VLM
+  # (vLLM) no startup; só os modelos clássicos (DocAnalysis) sob demanda, com
+  # footprint de VRAM muito menor. Use para extração rápida liberando VRAM para o
+  # bge-m3 rodar em paralelo. Aponte MINERU_API_URL=http://127.0.0.1:8012 e
+  # MINERU_BACKEND=pipeline. Normalmente roda-se ESTE **ou** o "mineru" (VLM) — os
+  # dois juntos podem estourar a VRAM numa GPU única.
+  mineru-pipeline:
+    build:
+      context: ./tmp
+    image: evidencia_mineru:local
+    container_name: evidencia_mineru_pipeline
+    command: ["mineru-api", "--host", "0.0.0.0", "--port", "8010", "--enable-vlm-preload", "false"]
+    environment:
+      MINERU_MODEL_SOURCE: local
+    ports:
+      - "8012:8010"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
 volumes:
   redis_data:
   minio_data:

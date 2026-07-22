@@ -114,8 +114,20 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 cp .env.example .env   # ajuste DSPACE_URL, QDRANT_URL, MINERU_API_URL, LLM_ENRICH_API_KEY, MINIO_*
 uv sync
 docker compose up -d redis minio minio-init   # Redis + MinIO (bucket privado + versionamento)
+docker compose up -d mineru-pipeline          # MinerU pipeline-only (:8012, ~6,5 GB VRAM)
 uv run python backend/main.py                  # sobe em http://127.0.0.1:8020
 ```
+
+### MinerU: dois serviços (escolha por VRAM × qualidade)
+
+O `docker-compose.yml` define **dois** serviços MinerU (imagem única `evidencia_mineru:local`, de `tmp/Dockerfile`, base vLLM). Ambos exigem **`--gpus all`** (com device único o vLLM falha com `Device string must not be empty`). Numa GPU única, rode **um ou outro** — juntos estouram a VRAM.
+
+| Serviço | Porta | VLM | VRAM | Quando usar |
+|---------|-------|-----|------|-------------|
+| `mineru-pipeline` | 8012 | não (`--enable-vlm-preload false`) | ~6,5 GB | **Padrão** — PDFs digitais/relatórios; mesma qualidade de tabela/texto, ~25% mais rápido, e libera a GPU p/ o bge-m3 rodar em paralelo |
+| `mineru` | 8011 | sim (vLLM residente) | ~36-44 GB | Layouts difíceis (manuscrito, tabelas irregulares, fórmulas, scans ruins) |
+
+O backend é escolhido por env, casado com o serviço: **pipeline-only** → `MINERU_API_URL=http://127.0.0.1:8012` + `MINERU_BACKEND=pipeline` (default do `.env.example`); **VLM** → `:8011` + `MINERU_BACKEND=hybrid-auto-engine`. O cliente MinerU no venv precisa da MESMA versão do servidor (protocolo) — hoje `mineru[all]~=3.4.4`.
 
 > Workers/scripts no **host** usam `MINIO_ENDPOINT=127.0.0.1:9000`; dentro do compose
 > o endpoint é `minio:9000`. Em produção: credenciais próprias (não `minioadmin`),

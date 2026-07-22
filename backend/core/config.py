@@ -23,6 +23,15 @@ CACHE_DIR = "/root/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f
 
 # API do MinerU rodando via Docker (container mineru-api, profile "api") — estágio 2.
 MINERU_API_URL = os.getenv("MINERU_API_URL", "http://127.0.0.1:8010")
+# Backend/método/idioma do MinerU (flags -b/-m/-l). Configuráveis para permitir
+# A/B de desempenho x qualidade sem alterar código:
+#   MINERU_BACKEND: hybrid-auto-engine (padrão, VLM — melhor qualidade, mais caro)
+#                   | pipeline (modelos clássicos, mais rápido/leve) | vlm-* | ...
+#   MINERU_METHOD:  auto (padrão) | txt (PDF nativo digital, pula OCR — rápido) | ocr
+#   MINERU_LANG:    latin (padrão) | ch | en | ...
+MINERU_BACKEND = os.getenv("MINERU_BACKEND", "hybrid-auto-engine").strip()
+MINERU_METHOD = os.getenv("MINERU_METHOD", "auto").strip()
+MINERU_LANG = os.getenv("MINERU_LANG", "latin").strip()
 
 # Repositório DSpace (RDApp) — estágio 1. Bitstreams são baixados de
 # {DSPACE_URL}/server/api/core/bitstreams/{uuid}/content

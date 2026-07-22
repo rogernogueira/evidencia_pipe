@@ -129,15 +129,20 @@ def process_pdf(pdf_path: Path, output_dir: Path, *, task_id=None, document_id=N
     file_output_dir = output_dir / basename
     file_output_dir.mkdir(parents=True, exist_ok=True)  # fora do lock
 
+    # Backend/método/idioma vêm da config (env) — permitem A/B de desempenho x
+    # qualidade sem alterar código. Defaults preservam o comportamento anterior
+    # (-m auto -l latin -b hybrid-auto-engine).
     cmd = [
         "/root/.local/bin/uv", "run", "mineru",
         "-p", str(pdf_path),
         "-o", str(output_dir),
         "--api-url", MINERU_API_URL,
-        "-m", "auto",
-        "-l", "latin",
-        "-b", "hybrid-auto-engine"
+        "-m", settings.MINERU_METHOD,
+        "-l", settings.MINERU_LANG,
+        "-b", settings.MINERU_BACKEND,
     ]
+    log.info("MinerU cmd: -m %s -l %s -b %s (api=%s)",
+             settings.MINERU_METHOD, settings.MINERU_LANG, settings.MINERU_BACKEND, MINERU_API_URL)
 
     stats = {'max_ram_mb': 0, 'max_vram_mb': 0}
     stop_event = threading.Event()

@@ -46,13 +46,20 @@ MinIO (SHA-256 + estágio `COMPLETED` no manifesto); `?force=true` reprocessa. V
 [`artifact_store.py`](backend/services/artifact_store.py) e
 [`manifest_repository.py`](backend/services/manifest_repository.py).
 
-## 1. Subir a infra (Redis + Flower + MinIO)
+## 1. Subir a infra (Redis + Flower + MinIO + MinerU)
 
 ```bash
-docker compose up -d          # redis :6379, flower :5555, minio :9000/:9001 (+ bucket privado)
+docker compose up -d redis flower minio minio-init
+docker compose up -d mineru-pipeline   # MinerU pipeline-only :8012 (~6,5 GB VRAM) — padrão
+# alternativa p/ layouts difíceis (VLM, ~36-44 GB, :8011): docker compose up -d mineru
 ```
 
 Flower: http://localhost:5555 · Console MinIO (admin): http://localhost:9001
+
+> **MinerU** tem dois serviços na mesma imagem (ver README): `mineru-pipeline` (:8012,
+> sem VLM, padrão) e `mineru` (:8011, VLM/vLLM). Ambos exigem `--gpus all`. Numa GPU
+> única rode **um ou outro**. Aponte `MINERU_API_URL`/`MINERU_BACKEND` no `.env` para
+> o serviço escolhido (default: `:8012` + `pipeline`).
 
 ## 2. Subir a API (produtor)
 

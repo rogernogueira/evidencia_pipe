@@ -18,3 +18,7 @@ wheels/
 data/
 output/
 qdrant_storage/
+
+# Área de build/scratch: versiona só o Dockerfile do MinerU, ignora o resto (logs, runs).
+tmp/*
+!tmp/Dockerfile
