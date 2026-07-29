@@ -11,7 +11,7 @@ num alvo único.
 | Arquivo | Papel |
 |---|---|
 | `evidencia-compose.service` | oneshot: `docker compose up -d redis flower minio minio-init mineru-pipeline` (`ExecStop` = `docker compose stop`) |
-| `evidencia-api.service` | API FastAPI — `uv run python backend/main.py` (:8020) |
+| `evidencia-api.service` | API FastAPI — `uv run python backend/main.py` (:8181, via `PORT` no `.env`) |
 | `evidencia-worker-light.service` | worker leve — filas `download,extract,llm`, `-c 4` |
 | `evidencia-worker-gpu.service` | worker GPU — fila `gpu`, `-c 1`, `WORKER_ROLE=gpu` (1 cópia do bge-m3 na VRAM) |
 | `evidencia.target` | alvo agregador dos 4 — sobe/derruba tudo de uma vez |

@@ -1,6 +1,6 @@
-# API/produtor do evidencia_pipe (FastAPI, :8020). Só enfileira; os workers processam.
+# API/produtor do evidencia_pipe (FastAPI, :8181 via PORT no .env). Só enfileira; os workers processam.
 [Unit]
-Description=evidencia_pipe - API FastAPI (:8020)
+Description=evidencia_pipe - API FastAPI (:8181)
 Requires=evidencia-compose.service
 After=evidencia-compose.service
 PartOf=evidencia.target
