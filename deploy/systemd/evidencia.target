@@ -1,0 +1,9 @@
+# Alvo agregador do evidencia_pipe: sobe/derruba infra + API + workers de uma vez.
+# Uso: systemctl start|stop|restart evidencia.target
+[Unit]
+Description=evidencia_pipe (stack completo: infra + API + workers)
+Wants=evidencia-compose.service evidencia-api.service evidencia-worker-light.service evidencia-worker-gpu.service
+After=evidencia-compose.service
+
+[Install]
+WantedBy=multi-user.target

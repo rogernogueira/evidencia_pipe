@@ -1,0 +1,20 @@
+# Infra Docker do evidencia_pipe (redis, flower, minio, minio-init, mineru-pipeline).
+# Os contêineres já têm restart: unless-stopped; este oneshot garante que sejam
+# subidos no boot e parados no shutdown junto com o resto do stack.
+[Unit]
+Description=evidencia_pipe - infra Docker (redis, flower, minio, mineru-pipeline)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+PartOf=evidencia.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/app/evidencia_pipe
+ExecStart=/usr/bin/docker compose up -d redis flower minio minio-init mineru-pipeline
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Worker de GPU do evidencia_pipe: fila gpu (embedding bge-m3 + upsert no Qdrant).
+# concurrency=1 e WORKER_ROLE=gpu: UMA cópia do bge-m3 na VRAM. Nunca use -c > 1 (OOM).
+[Unit]
+Description=evidencia_pipe - worker de GPU (embedding + Qdrant)
+Requires=evidencia-compose.service
+After=evidencia-compose.service
+PartOf=evidencia.target
+
+[Service]
+Type=simple
+WorkingDirectory=/app/evidencia_pipe
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=WORKER_ROLE=gpu
+ExecStart=/root/.local/bin/uv run celery -A backend.celery_app worker -Q gpu -c 1 -E -n gpu@%%h
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

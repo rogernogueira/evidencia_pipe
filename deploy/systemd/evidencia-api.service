@@ -1,0 +1,17 @@
+# API/produtor do evidencia_pipe (FastAPI, :8020). Só enfileira; os workers processam.
+[Unit]
+Description=evidencia_pipe - API FastAPI (:8020)
+Requires=evidencia-compose.service
+After=evidencia-compose.service
+PartOf=evidencia.target
+
+[Service]
+Type=simple
+WorkingDirectory=/app/evidencia_pipe
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/.local/bin/uv run python backend/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

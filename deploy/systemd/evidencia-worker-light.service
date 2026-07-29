@@ -1,0 +1,18 @@
+# Worker leve do evidencia_pipe: filas download, extract e llm (IO-bound, concorrência 4).
+# %%h -> systemd escapa para %h, que o Celery expande como o hostname (nome do worker).
+[Unit]
+Description=evidencia_pipe - worker leve (download, extract, llm)
+Requires=evidencia-compose.service
+After=evidencia-compose.service
+PartOf=evidencia.target
+
+[Service]
+Type=simple
+WorkingDirectory=/app/evidencia_pipe
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/.local/bin/uv run celery -A backend.celery_app worker -Q download,extract,llm -c 4 -E -n light@%%h
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
