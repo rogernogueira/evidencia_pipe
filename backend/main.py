@@ -57,7 +57,7 @@ app.add_middleware(
 
 @app.get("/health", tags=["health"])
 async def health():
-    return {"status": "ok", "service": "evidencia_pipe"}
+    return {"status": "ok", "service": "evidencia_pipe — DSpace ingestion pipeline"}
 
 
 app.include_router(api_router)
