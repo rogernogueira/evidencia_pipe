@@ -27,13 +27,14 @@ async def search_semantic(
     type: str = Query(default="hybrid", description="Modo: 'hybrid' (RRF dense+sparse), 'dense' ou 'sparse'"),
     doc_id: str = Query(default="", description="Filtra por doc_id (ex: 'relatorio.pdf')"),
     uuid: str = Query(default="", description="Filtra pelo UUID do item DSpace (item_uuid)"),
+    profile: str = Query(default="", description="Perfil de recuperação (§21): ''=auto | general | quantitative | methodological | bibliographic"),
     semantic: SemanticSearch = Depends(get_semantic_search),
 ):
     """Busca semântica híbrida (bge-m3 dense + sparse → fusão RRF) via Qdrant sobre a
     collection de chunks do estágio 3 (`evidencia_chunks`)."""
     log_api.info(
-        "GET /api/search/semantic?q=%r type=%r limit=%d doc_id=%r uuid=%r [client=%s]",
-        q, type, limit, doc_id, uuid, request.client.host if request.client else "?",
+        "GET /api/search/semantic?q=%r type=%r limit=%d doc_id=%r uuid=%r profile=%r [client=%s]",
+        q, type, limit, doc_id, uuid, profile, request.client.host if request.client else "?",
     )
     if not await semantic.ensure_connected():
         log_api.warning(
@@ -51,7 +52,7 @@ async def search_semantic(
         )
     t0 = time.perf_counter()
     results = await semantic.search(
-        q, limit=limit, doc_id=doc_id or None, uuid=uuid or None, type=type,
+        q, limit=limit, doc_id=doc_id or None, uuid=uuid or None, type=type, profile=profile,
     )
     log_api.info(
         "GET /api/search/semantic: %d resultado(s) em %.3fs",

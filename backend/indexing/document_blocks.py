@@ -43,20 +43,31 @@ from backend.indexing.chunk_models import (
     BLOCK_REFERENCE,
     BLOCK_TABLE,
     BLOCK_UNKNOWN,
+    SECTION_ACRONYM_LIST,
+    SECTION_BIBLIOGRAPHY,
     DocumentBlock,
     DocumentStructureParseError,
 )
-
-# Rótulos que iniciam a seção de referências bibliográficas (§16).
-_REFERENCES_HEADING_RE = re.compile(
-    r"^\s*(refer[êe]ncias?|bibliografia|references|obras\s+citadas)\b",
-    re.IGNORECASE,
-)
+from backend.indexing.cross_page_reconstruction import reconstruct_cross_page
+from backend.indexing.section_classifier import SectionStateMachine, parse_acronym_line
+from backend.indexing.text_normalization import normalize_text as _normalize
 
 # Header/footer é considerado "repetido" quando o MESMO texto normalizado aparece
 # em pelo menos este número de páginas (ou fração das páginas, o que for menor).
 _REPEAT_MIN_PAGES = 3
 _REPEAT_MIN_FRACTION = 0.5
+
+# Tipos cuja estrutura NÃO deve ser normalizada como prosa (§8): a quebra/marcação
+# é significativa (listas, tabelas em markdown, legendas de figura, fórmula LaTeX).
+_NO_NORMALIZE_TYPES = frozenset({BLOCK_LIST, BLOCK_TABLE, BLOCK_FIGURE_CAPTION, BLOCK_FORMULA})
+
+# Operadores/comandos LaTeX que indicam uma equação "de verdade" (§9).
+_MATH_OPERATORS_RE = re.compile(
+    r"[=<>+×·]|\\(frac|sum|int|prod|sqrt|underbrace|overbrace|times|cdot|le|ge|neq|approx|"
+    r"partial|nabla|alpha|beta|lambda|sigma|mu|log|ln|exp|min|max)\b"
+)
+# Padrão de ordinal/símbolo mal lido como equação (§9): "3^{o}", "5 \textdegree", "_{3^0}".
+_ORDINAL_LIKE_RE = re.compile(r"^\s*[_^]?\s*\{?\s*\d{1,3}\s*[\^_]?\s*\{?\s*[oaºª°0]\s*\}?\s*\}?\s*$")
 
 
 def _norm_ws(text: str) -> str:
@@ -99,17 +110,25 @@ class MinerUDocumentParser:
         remove_repeated_footers: bool = True,
         keep_footnotes: bool = True,
         images_base_uri: str = "",
+        normalize_text: bool = False,
+        reconstruct_cross_page: bool = False,
     ) -> None:
         self.remove_repeated_headers = remove_repeated_headers
         self.remove_repeated_footers = remove_repeated_footers
         self.keep_footnotes = keep_footnotes
         self.images_base_uri = images_base_uri.rstrip("/")
+        # Política v2: normalização de texto (§8) e reconstrução cross-page (§7).
+        self.normalize_text = normalize_text
+        self.reconstruct_cross_page = reconstruct_cross_page
         # Métricas preenchidas durante o parse (lidas pelo chunker).
         self.removed_header_blocks = 0
         self.removed_footer_blocks = 0
         self.removed_page_number_blocks = 0
+        self.cross_page_merges = 0
         self.document_title: Optional[str] = None
         self.warnings: list[str] = []
+        # Dicionário de siglas (§5) — expansão de consulta; NÃO gera chunks.
+        self.acronyms: dict[str, str] = {}
 
     # -- API pública --------------------------------------------------------
 
@@ -130,6 +149,8 @@ class MinerUDocumentParser:
         raw = self._flatten(pages)
         raw = self._drop_repeated_furniture(raw)
         blocks = self._assign_sections(raw)
+        if self.reconstruct_cross_page:
+            blocks, self.cross_page_merges = reconstruct_cross_page(blocks)
         return blocks, "mineru_json"
 
     def parse_markdown(self, markdown: str) -> tuple[list[DocumentBlock], str]:
@@ -152,8 +173,12 @@ class MinerUDocumentParser:
     # -- extração de blocos MinerU -----------------------------------------
 
     def _flatten(self, pages: list) -> list[dict]:
-        """Achata páginas → blocos "crus" (dicts intermediários), preservando ordem/página."""
+        """Achata páginas → blocos "crus" (dicts intermediários), preservando ordem/página.
+
+        Também captura o número de página IMPRESSO (bloco `page_number`) por página (§2)
+        e o associa a todos os blocos daquela página."""
         out: list[dict] = []
+        printed_by_page: dict[int, int] = {}
         for page_idx, page_blocks in enumerate(pages):
             page_num = page_idx + 1
             if not isinstance(page_blocks, list):
@@ -161,16 +186,32 @@ class MinerUDocumentParser:
             for block in page_blocks:
                 if not isinstance(block, dict):
                     continue
-                parsed = self._parse_block(block, page_num)
+                # Captura o nº impresso antes de qualquer descarte (§2).
+                if block.get("type") == "page_number":
+                    printed = self._printed_page_number(block)
+                    if printed is not None:
+                        printed_by_page[page_num] = printed
+                parsed = self._parse_block(block, page_num, page_idx)
                 if parsed is not None:
                     out.append(parsed)
+        # Associa o nº impresso a cada bloco da página.
+        for b in out:
+            b["printed_page_number"] = printed_by_page.get(b.get("page"))
         return out
 
-    def _parse_block(self, block: dict, page_num: int) -> Optional[dict]:
+    @staticmethod
+    def _printed_page_number(block: dict) -> Optional[int]:
+        """Extrai o número impresso de um bloco page_number (§2). Apenas arábico."""
+        text = _inline_to_text(((block.get("content") or {}).get("page_number_content", [])))
+        m = re.search(r"\d+", text or "")
+        return int(m.group()) if m else None
+
+    def _parse_block(self, block: dict, page_num: int, page_index: int) -> Optional[dict]:
         b_type = block.get("type")
         content = block.get("content")
         bbox = block.get("bbox")
-        base = {"page": page_num, "bbox": bbox, "level": None, "source": f"mineru:{b_type}"}
+        base = {"page": page_num, "page_index": page_index, "bbox": bbox,
+                "level": None, "source": f"mineru:{b_type}"}
 
         if b_type == "title":
             text = _inline_to_text((content or {}).get("title_content", []))
@@ -201,7 +242,10 @@ class MinerUDocumentParser:
         if b_type == "equation_interline":
             math = (content or {}).get("math_content", "")
             math = math.strip() if isinstance(math, str) else ""
-            return {**base, "type": BLOCK_FORMULA, "text": f"$$ {math} $$"} if math else None
+            if not math:
+                return None
+            return {**base, "type": BLOCK_FORMULA, "text": f"$$ {math} $$",
+                    "meta": {"equation_confidence": self._equation_confidence(math)}}
 
         if b_type == "page_header":
             text = _inline_to_text((content or {}).get("page_header_content", []))
@@ -325,6 +369,25 @@ class MinerUDocumentParser:
         return path
 
     @staticmethod
+    def _equation_confidence(latex: str) -> float:
+        """Confiança de que o LaTeX é uma equação real, não um ordinal/símbolo (§9).
+
+        Baixa (<0.4) quando: parece ordinal, é muito curto ou não tem operadores
+        matemáticos. Alta (~0.9) quando há operadores/comandos LaTeX relevantes."""
+        s = (latex or "").strip()
+        if not s:
+            return 0.0
+        # ordinal/símbolo mal reconhecido (ex.: "3^{o}", "5 \textdegree").
+        if _ORDINAL_LIKE_RE.match(s) or "textdegree" in s:
+            return 0.25
+        n_ops = len(_MATH_OPERATORS_RE.findall(s))
+        if n_ops >= 1 and len(s) >= 6:
+            return 0.9
+        if len(re.sub(r"[\s{}\\]", "", s)) < 5:  # pouquíssimo conteúdo matemático
+            return 0.3
+        return 0.6
+
+    @staticmethod
     def _best_effort_text(content: Any) -> str:
         if isinstance(content, str):
             return content.strip()
@@ -396,9 +459,12 @@ class MinerUDocumentParser:
     # -- atribuição de seção + materialização em DocumentBlock -------------
 
     def _assign_sections(self, raw: list[dict]) -> list[DocumentBlock]:
+        """Atribui `section_path` (hierarquia por numeração, §4) e `section_kind`
+        (máquina de estados, §4) a cada bloco. Também alimenta o dicionário de siglas
+        (§5) e converte parágrafos/listas em referências dentro da bibliografia (§15)."""
         blocks: list[DocumentBlock] = []
         stack: list[tuple[int, str]] = []  # (heading_level, title)
-        in_references = False
+        sm = SectionStateMachine()
 
         for order_index, b in enumerate(raw):
             b_type = b["type"]
@@ -407,41 +473,70 @@ class MinerUDocumentParser:
                 continue
 
             if b_type == BLOCK_HEADING:
-                level = b.get("level") or 1
-                is_ref = bool(_REFERENCES_HEADING_RE.match(text))
-                in_references = is_ref
-                # atualiza a pilha hierárquica
+                level, kind = sm.feed_heading(text, b.get("level"))
+                # atualiza a pilha hierárquica pelo nível efetivo (numeração > MinerU)
                 while stack and stack[-1][0] >= level:
                     stack.pop()
                 stack.append((level, text))
                 section_path = [t for _, t in stack]
                 blocks.append(self._mk_block(order_index, BLOCK_HEADING, text, b,
-                                             section_path, heading_level=level))
+                                             section_path, kind, heading_level=level))
                 continue
 
+            kind = sm.current
             effective_type = b_type
-            if in_references and b_type in (BLOCK_PARAGRAPH, BLOCK_LIST):
+            if kind == SECTION_BIBLIOGRAPHY and b_type in (BLOCK_PARAGRAPH, BLOCK_LIST):
                 effective_type = BLOCK_REFERENCE
 
+            # Dicionário de siglas (§5): coleta pares de listas/parágrafos da seção.
+            if kind == SECTION_ACRONYM_LIST and b_type in (BLOCK_LIST, BLOCK_PARAGRAPH):
+                self._collect_acronyms(text)
+
             section_path = [t for _, t in stack]
-            blocks.append(self._mk_block(order_index, effective_type, text, b, section_path))
+            blocks.append(self._mk_block(order_index, effective_type, text, b, section_path, kind))
         return blocks
+
+    def _collect_acronyms(self, text: str) -> None:
+        for line in text.splitlines():
+            pair = parse_acronym_line(line)
+            if pair:
+                sigla, expansao = pair
+                self.acronyms.setdefault(sigla, expansao)
 
     def _mk_block(
         self, order_index: int, block_type: str, text: str, raw: dict,
-        section_path: list[str], *, heading_level: Optional[int] = None,
+        section_path: list[str], section_kind: Optional[str] = None,
+        *, heading_level: Optional[int] = None,
     ) -> DocumentBlock:
+        # §6: cabeçalho/rodapé/nº de página são preservados, mas não chunkáveis.
+        is_furniture = block_type in (BLOCK_HEADER, BLOCK_FOOTER, BLOCK_PAGE_NUMBER)
+        meta = raw.get("meta", {}) or {}
+        # §8: raw_text = extraído; text = normalizado (só para prosa; lista/tabela/figura/
+        # fórmula mantêm a estrutura). Preserva números/datas/moedas.
+        normalized = text
+        if self.normalize_text and block_type not in _NO_NORMALIZE_TYPES:
+            normalized = _normalize(text) or text
         return DocumentBlock(
             block_id=f"block-{order_index:04d}",
             block_type=block_type,
-            text=text,
+            text=normalized,
+            raw_text=text,
+            equation_confidence=meta.get("equation_confidence"),
             order_index=order_index,
             page_number=raw.get("page"),
+            page_index=raw.get("page_index"),
+            printed_page_number=raw.get("printed_page_number"),
             heading_level=heading_level,
             section_path=section_path,
+            section_kind=section_kind,
+            normalized_type="page_furniture" if is_furniture else None,
+            preserve=True,
+            chunkable=not is_furniture,
+            embeddable=not is_furniture,
+            indexable=not is_furniture,
             bbox=[float(x) for x in raw["bbox"]] if isinstance(raw.get("bbox"), list) else None,
             source_reference=raw.get("source"),
-            metadata=raw.get("meta", {}) or {},
+            metadata=meta,
         )
 
     # -- markdown fallback --------------------------------------------------

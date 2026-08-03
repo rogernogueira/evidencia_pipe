@@ -248,11 +248,77 @@ CHUNK_REMOVE_REPEATED_HEADERS = _as_bool(os.getenv("CHUNK_REMOVE_REPEATED_HEADER
 CHUNK_REMOVE_REPEATED_FOOTERS = _as_bool(os.getenv("CHUNK_REMOVE_REPEATED_FOOTERS"), True)
 CHUNK_KEEP_FOOTNOTES = _as_bool(os.getenv("CHUNK_KEEP_FOOTNOTES"), True)
 
-# Referências bibliográficas: include | separate | exclude.
+# Referências bibliográficas: include | separate | exclude | metadata_only.
+# metadata_only (política v2, §15): preserva a referência como metadado, mas NÃO gera
+# chunk recuperável no índice principal (equivale, hoje, a não embeddar — ainda não há
+# índice bibliográfico separado além do modo `separate`).
 CHUNK_REFERENCES_MODE = os.getenv("CHUNK_REFERENCES_MODE", "separate").strip().lower()
 
 # Campo textual efetivamente enviado ao embedder: text | contextualized_text.
 EMBEDDING_TEXT_FIELD = os.getenv("EMBEDDING_TEXT_FIELD", "contextualized_text").strip()
+
+# --------------------------------------------------------------------------
+# Política de Chunking v2 (mineru-structural-token-v2) — ver
+# Knowledge/"Política de Chunking v2 — evidencia_pipe" e os artefatos.
+#
+# Estratégia de rollout: todos os flags COMPORTAMENTAIS abaixo têm default igual ao
+# comportamento da v1, de modo que apenas ADICIONAR estas variáveis NÃO muda o
+# pipeline. A v2 é ativada ligando o grupo de flags no .env (e, por consequência do
+# novo `chunking_config_hash`, exige reindexação — scripts/reindex_from_minio.py).
+#
+# Os ENRIQUECIMENTOS de payload/metadados (section_kind, retrieval_profile, número de
+# página impresso, flags is_*) são SEMPRE calculados — são aditivos e inofensivos.
+# --------------------------------------------------------------------------
+CHUNKING_VERSION_V2 = "mineru-structural-token-v2"
+
+MINERU_PRIMARY_SOURCE = os.getenv("MINERU_PRIMARY_SOURCE", "content_list_v2.json").strip()
+MINERU_PRESERVE_RAW_BLOCKS = _as_bool(os.getenv("MINERU_PRESERVE_RAW_BLOCKS"), True)
+MINERU_USE_BBOX = _as_bool(os.getenv("MINERU_USE_BBOX"), True)
+# §7 — reconstrução de parágrafos partidos entre páginas (Fase 2). Default off.
+MINERU_RECONSTRUCT_CROSS_PAGE_PARAGRAPHS = _as_bool(
+    os.getenv("MINERU_RECONSTRUCT_CROSS_PAGE_PARAGRAPHS"), False
+)
+# §8 — normalização do texto (raw_text × normalized_text). Default off = v1 (texto cru).
+# NUNCA altera números/datas/valores; só limpa controles, hifenização e espaços.
+CHUNK_NORMALIZE_TEXT = _as_bool(os.getenv("CHUNK_NORMALIZE_TEXT"), False)
+# §9 — abaixo deste equation_confidence a equação é excluída do embedding (merge_with_context).
+CHUNK_EQUATION_MIN_CONFIDENCE = float(os.getenv("CHUNK_EQUATION_MIN_CONFIDENCE", "0.4"))
+
+# Modos por seção/tipo (default = comportamento v1).
+#   front_matter: include (v1, entra no fluxo comum) | metadata_only (v2, não chunka)
+CHUNK_FRONT_MATTER_MODE = os.getenv("CHUNK_FRONT_MATTER_MODE", "include").strip().lower()
+#   acronym: ignore (v1) | query_dictionary (v2, extrai dicionário de expansão, §5)
+CHUNK_ACRONYM_MODE = os.getenv("CHUNK_ACRONYM_MODE", "ignore").strip().lower()
+#   appendix: flat (v1) | classify (v2, analítico×administrativo, §16)
+CHUNK_APPENDIX_MODE = os.getenv("CHUNK_APPENDIX_MODE", "flat").strip().lower()
+#   table: always (v1) | conditional (v2, exige contexto/qualidade, §10)  [Fase 3]
+CHUNK_TABLE_MODE = os.getenv("CHUNK_TABLE_MODE", "always").strip().lower()
+#   chart: raw (v1) | caption_context (v2, valida coerência, §11)          [Fase 3]
+CHUNK_CHART_MODE = os.getenv("CHUNK_CHART_MODE", "raw").strip().lower()
+#   image: always (v1) | conditional (v2, §12)                             [Fase 3]
+CHUNK_IMAGE_MODE = os.getenv("CHUNK_IMAGE_MODE", "always").strip().lower()
+#   footnote: keep (v1) | merge_or_metadata (v2, §14)                      [Fase futura]
+CHUNK_FOOTNOTE_MODE = os.getenv("CHUNK_FOOTNOTE_MODE", "keep").strip().lower()
+#   equation: raw (v1) | merge_with_context (v2, §9)                       [Fase futura]
+CHUNK_EQUATION_MODE = os.getenv("CHUNK_EQUATION_MODE", "raw").strip().lower()
+
+# Controle de qualidade (§17). Defaults não-restritivos (não mudam a v1).
+CHUNK_REQUIRE_COMPLETE_SENTENCE = _as_bool(os.getenv("CHUNK_REQUIRE_COMPLETE_SENTENCE"), False)
+CHUNK_REQUIRE_SECTION_CONTEXT = _as_bool(os.getenv("CHUNK_REQUIRE_SECTION_CONTEXT"), False)
+CHUNK_DEDUPLICATE_BLOCKS = _as_bool(os.getenv("CHUNK_DEDUPLICATE_BLOCKS"), False)
+# 0.0 = desabilitado (não rejeita por score). A v2 recomenda 0.75 / revisão 0.55.
+CHUNK_MIN_QUALITY_SCORE = float(os.getenv("CHUNK_MIN_QUALITY_SCORE", "0.0"))
+CHUNK_REVIEW_QUALITY_SCORE = float(os.getenv("CHUNK_REVIEW_QUALITY_SCORE", "0.55"))
+CHUNK_MAX_OCR_NOISE_SCORE = float(os.getenv("CHUNK_MAX_OCR_NOISE_SCORE", "0.65"))
+
+# Filtros da BUSCA por perfil de recuperação (§21). Default off = busca v1 (sem filtro).
+SEARCH_DEFAULT_PROFILE = os.getenv("SEARCH_DEFAULT_PROFILE", "general").strip().lower()
+SEARCH_EXCLUDE_FRONT_MATTER = _as_bool(os.getenv("SEARCH_EXCLUDE_FRONT_MATTER"), False)
+SEARCH_EXCLUDE_REFERENCES = _as_bool(os.getenv("SEARCH_EXCLUDE_REFERENCES"), False)
+SEARCH_EXCLUDE_NAVIGATION_LISTS = _as_bool(os.getenv("SEARCH_EXCLUDE_NAVIGATION_LISTS"), False)
+SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA = _as_bool(
+    os.getenv("SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA"), False
+)
 
 
 def validate_chunking_config() -> None:
@@ -271,10 +337,31 @@ def validate_chunking_config() -> None:
          f"CHUNK_FORCE_SPLIT_ABOVE_TOKENS ({CHUNK_FORCE_SPLIT_ABOVE_TOKENS}) deve ser >= CHUNK_MAX_TOKENS ({CHUNK_MAX_TOKENS})"),
         (CHUNKING_STRATEGY in {"structural_tokens", "legacy_chars"},
          f"CHUNKING_STRATEGY inválido: {CHUNKING_STRATEGY!r} (use 'structural_tokens' ou 'legacy_chars')"),
-        (CHUNK_REFERENCES_MODE in {"include", "separate", "exclude"},
+        (CHUNK_REFERENCES_MODE in {"include", "separate", "exclude", "metadata_only"},
          f"CHUNK_REFERENCES_MODE inválido: {CHUNK_REFERENCES_MODE!r}"),
         (EMBEDDING_TEXT_FIELD in {"text", "contextualized_text"},
          f"EMBEDDING_TEXT_FIELD inválido: {EMBEDDING_TEXT_FIELD!r}"),
+        # --- Política v2 (§23): valida os enums dos novos modos ---
+        (CHUNK_FRONT_MATTER_MODE in {"include", "metadata_only"},
+         f"CHUNK_FRONT_MATTER_MODE inválido: {CHUNK_FRONT_MATTER_MODE!r}"),
+        (CHUNK_ACRONYM_MODE in {"ignore", "query_dictionary"},
+         f"CHUNK_ACRONYM_MODE inválido: {CHUNK_ACRONYM_MODE!r}"),
+        (CHUNK_APPENDIX_MODE in {"flat", "classify"},
+         f"CHUNK_APPENDIX_MODE inválido: {CHUNK_APPENDIX_MODE!r}"),
+        (CHUNK_TABLE_MODE in {"always", "conditional"},
+         f"CHUNK_TABLE_MODE inválido: {CHUNK_TABLE_MODE!r}"),
+        (CHUNK_CHART_MODE in {"raw", "caption_context"},
+         f"CHUNK_CHART_MODE inválido: {CHUNK_CHART_MODE!r}"),
+        (CHUNK_IMAGE_MODE in {"always", "conditional"},
+         f"CHUNK_IMAGE_MODE inválido: {CHUNK_IMAGE_MODE!r}"),
+        (CHUNK_FOOTNOTE_MODE in {"keep", "merge_or_metadata"},
+         f"CHUNK_FOOTNOTE_MODE inválido: {CHUNK_FOOTNOTE_MODE!r}"),
+        (CHUNK_EQUATION_MODE in {"raw", "merge_with_context"},
+         f"CHUNK_EQUATION_MODE inválido: {CHUNK_EQUATION_MODE!r}"),
+        (SEARCH_DEFAULT_PROFILE in {"general", "quantitative", "methodological", "bibliographic"},
+         f"SEARCH_DEFAULT_PROFILE inválido: {SEARCH_DEFAULT_PROFILE!r}"),
+        (0.0 <= CHUNK_MIN_QUALITY_SCORE <= 1.0,
+         f"CHUNK_MIN_QUALITY_SCORE deve estar em [0,1]: {CHUNK_MIN_QUALITY_SCORE}"),
     ]
     problems = [msg for ok, msg in checks if not ok]
     if problems:

@@ -74,6 +74,37 @@ BODY_BLOCK_TYPES = frozenset({
 })
 
 
+# ---------------------------------------------------------------------------
+# Estados/tipos da seção documental (política v2, §4)
+# ---------------------------------------------------------------------------
+
+SECTION_FRONT_MATTER = "front_matter"
+SECTION_BODY = "body"
+SECTION_BIBLIOGRAPHY = "bibliography"
+SECTION_ANALYTICAL_APPENDIX = "analytical_appendix"
+SECTION_ADMINISTRATIVE_APPENDIX = "administrative_appendix"
+SECTION_TABLE_OF_CONTENTS = "table_of_contents"
+SECTION_LIST_OF_FIGURES = "list_of_figures"
+SECTION_LIST_OF_TABLES = "list_of_tables"
+SECTION_LIST_OF_CHARTS = "list_of_charts"
+SECTION_ACRONYM_LIST = "acronym_list"
+
+# Seções pré-textuais (§5) — preservadas como metadados, nunca embeddadas por padrão.
+FRONT_MATTER_SECTION_KINDS = frozenset({SECTION_FRONT_MATTER})
+
+# Seções de navegação (§5/§13) — preservadas para navegação, não recuperáveis.
+NAVIGATION_SECTION_KINDS = frozenset({
+    SECTION_TABLE_OF_CONTENTS, SECTION_LIST_OF_FIGURES, SECTION_LIST_OF_TABLES,
+    SECTION_LIST_OF_CHARTS, SECTION_ACRONYM_LIST,
+})
+
+# Seções que NÃO alimentam a busca geral por padrão (§21).
+NON_DEFAULT_SEARCHABLE_SECTION_KINDS = (
+    FRONT_MATTER_SECTION_KINDS | NAVIGATION_SECTION_KINDS
+    | {SECTION_BIBLIOGRAPHY, SECTION_ADMINISTRATIVE_APPENDIX}
+)
+
+
 class DocumentBlock(BaseModel):
     """Bloco estrutural normalizado (independe da fonte MinerU JSON/Markdown)."""
 
@@ -89,6 +120,31 @@ class DocumentBlock(BaseModel):
     bbox: Optional[list[float]] = None
     source_reference: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # --- Política v2 (aditivo; default preserva a semântica v1) --------------
+    # §2: dois eixos de página. page_index = posição no array; printed_page_number =
+    # número impresso (bloco page_number). page_number (acima) permanece = page_index+1.
+    page_index: Optional[int] = None
+    printed_page_number: Optional[int] = None
+    # §8: texto exatamente como extraído (antes da normalização). `text` é o normalizado.
+    raw_text: Optional[str] = None
+    # §4: classe da seção corrente (body, front_matter, bibliography, appendix…).
+    section_kind: Optional[str] = None
+    # §3: tipo normalizado fino (body_paragraph, structured_table, navigation_list…).
+    normalized_type: Optional[str] = None
+    # §6/§16: fronteiras de estado do bloco.
+    preserve: bool = True
+    chunkable: bool = True
+    embeddable: bool = True
+    indexable: bool = True
+    # §9/§11/§17: confianças e score (None = não avaliado nesta fase).
+    quality_score: Optional[float] = None
+    equation_confidence: Optional[float] = None
+    chart_data_confidence: Optional[float] = None
+    ranking_weight: Optional[float] = None
+    # §7: reconstrução entre páginas.
+    cross_page_merged: bool = False
+    source_block_ids: list[str] = Field(default_factory=list)
 
 
 class StructuralChunk(BaseModel):
@@ -118,6 +174,30 @@ class StructuralChunk(BaseModel):
     page_start: Optional[int] = None
     page_end: Optional[int] = None
     page_numbers: list[int] = Field(default_factory=list)
+
+    # --- Política v2 (§22): eixos de página impressa + classificação/recuperação ---
+    printed_page_start: Optional[int] = None
+    printed_page_end: Optional[int] = None
+    printed_page_numbers: list[int] = Field(default_factory=list)
+
+    section_kind: Optional[str] = None
+    normalized_content_type: Optional[str] = None
+
+    # Perfis em que o chunk pode ser recuperado (general/quantitative/…), e se entra
+    # na busca por padrão. ranking_weight pondera apêndices (§16).
+    retrieval_profile: list[str] = Field(default_factory=list)
+    searchable_by_default: bool = True
+    ranking_weight: Optional[float] = None
+
+    # Flags booleanas do payload (§22) — atalhos de filtro no Qdrant.
+    is_table: bool = False
+    is_chart: bool = False
+    is_reference: bool = False
+    is_appendix: bool = False
+
+    quality_score: Optional[float] = None
+    semantic_completeness: Optional[bool] = None
+    cross_page_merged: bool = False
 
     overlap_token_count: int = 0
     overlap_source_chunk_id: Optional[str] = None
@@ -165,6 +245,7 @@ class ChunkingMetrics(BaseModel):
     removed_header_blocks: int = 0
     removed_footer_blocks: int = 0
     removed_page_number_blocks: int = 0
+    cross_page_merges: int = 0
     rejected_chunks: int = 0
 
     blocks_by_type: dict[str, int] = Field(default_factory=dict)
@@ -214,6 +295,7 @@ class ChunkingResult(BaseModel):
             "removed_header_blocks": m.removed_header_blocks,
             "removed_footer_blocks": m.removed_footer_blocks,
             "removed_page_number_blocks": m.removed_page_number_blocks,
+            "cross_page_merges": m.cross_page_merges,
             "rejected_chunks": m.rejected_chunks,
             "blocks_by_type": m.blocks_by_type,
             "rejected_by_reason": m.rejected_by_reason,

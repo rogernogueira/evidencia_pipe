@@ -19,15 +19,62 @@ from qdrant_client.models import (
     Filter,
     Fusion,
     FusionQuery,
+    MatchAny,
     MatchValue,
     Prefetch,
     SparseVector,
 )
 
-from backend.core.config import DENSE_MODEL, QDRANT_COLLECTION, QDRANT_TIMEOUT_SECONDS, QDRANT_URL
+from backend.core.config import (
+    DENSE_MODEL,
+    QDRANT_COLLECTION,
+    QDRANT_TIMEOUT_SECONDS,
+    QDRANT_URL,
+    SEARCH_DEFAULT_PROFILE,
+    SEARCH_EXCLUDE_FRONT_MATTER,
+    SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA,
+    SEARCH_EXCLUDE_NAVIGATION_LISTS,
+    SEARCH_EXCLUDE_REFERENCES,
+)
 from backend.core.logger import log, log_api
 from backend.core.schemas import SearchResult
+from backend.indexing.retrieval_profile import (
+    PROFILE_GENERAL,
+    detect_query_profile,
+    profile_exclusions,
+)
 from backend.services.embedder import BgeM3EmbedderService
+
+
+def _search_filtering_enabled() -> bool:
+    """Filtro por perfil só age se alguma flag SEARCH_EXCLUDE_* estiver ligada.
+
+    Default (todas off) → busca v1: sem filtro de perfil, comportamento inalterado.
+    Requer dados indexados pela política v2 (payload com searchable_by_default etc.)."""
+    return any((
+        SEARCH_EXCLUDE_FRONT_MATTER,
+        SEARCH_EXCLUDE_REFERENCES,
+        SEARCH_EXCLUDE_NAVIGATION_LISTS,
+        SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA,
+    ))
+
+
+def _profile_conditions(profile: str) -> tuple[list, list]:
+    """(must, must_not) do Qdrant para um perfil de recuperação (§21)."""
+    ex = profile_exclusions(profile)
+    must: list = []
+    must_not: list = []
+    if ex.require_searchable_by_default:
+        must.append(FieldCondition(key="searchable_by_default", match=MatchValue(value=True)))
+    if ex.require_is_reference:
+        must.append(FieldCondition(key="is_reference", match=MatchValue(value=True)))
+    if ex.exclude_is_reference:
+        must_not.append(FieldCondition(key="is_reference", match=MatchValue(value=True)))
+    if ex.exclude_section_kinds:
+        must_not.append(
+            FieldCondition(key="section_kind", match=MatchAny(any=list(ex.exclude_section_kinds)))
+        )
+    return must, must_not
 
 
 class SemanticSearch:
@@ -89,10 +136,14 @@ class SemanticSearch:
         doc_id: Optional[str] = None,
         uuid: Optional[str] = None,
         type: str = "hybrid",
+        profile: str = "",
     ) -> list[SearchResult]:
         """Consulta a collection. `type`: 'hybrid' (RRF dense+sparse), 'dense' ou 'sparse'.
 
         Filtros combináveis: `uuid` → payload.item_uuid; `doc_id` → payload.doc_id.
+        `profile` (§21): '' = auto (detecta a intenção da consulta) | general | quantitative
+        | methodological | bibliographic. O filtro de perfil só age se alguma flag
+        SEARCH_EXCLUDE_* estiver ligada OU se `profile` for explicitamente informado.
         """
         if not await self.ensure_connected():
             return []
@@ -106,11 +157,25 @@ class SemanticSearch:
             sparse_values = [float(v) for v in lexical_weights.values()]
 
             conditions = []
+            must_not: list = []
             if uuid and uuid.strip():
                 conditions.append(FieldCondition(key="item_uuid", match=MatchValue(value=uuid.strip())))
             if doc_id and doc_id.strip():
                 conditions.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id.strip())))
-            query_filter = Filter(must=conditions) if conditions else None
+
+            # --- Filtro por perfil de recuperação (§21) ---
+            explicit = (profile or "").strip().lower()
+            if explicit or _search_filtering_enabled():
+                resolved = explicit or (detect_query_profile(query) or SEARCH_DEFAULT_PROFILE or PROFILE_GENERAL)
+                p_must, p_must_not = _profile_conditions(resolved)
+                conditions.extend(p_must)
+                must_not.extend(p_must_not)
+                log_api.info("search profile=%r (resolvido de %r)", resolved, explicit or "auto")
+
+            query_filter = (
+                Filter(must=conditions or None, must_not=must_not or None)
+                if (conditions or must_not) else None
+            )
 
             if type == "hybrid":
                 results = await self._client.query_points(

@@ -540,6 +540,8 @@ def _index_structural_document(
         remove_repeated_headers=settings.CHUNK_REMOVE_REPEATED_HEADERS,
         remove_repeated_footers=settings.CHUNK_REMOVE_REPEATED_FOOTERS,
         keep_footnotes=settings.CHUNK_KEEP_FOOTNOTES,
+        normalize_text=settings.CHUNK_NORMALIZE_TEXT,
+        reconstruct_cross_page=settings.MINERU_RECONSTRUCT_CROSS_PAGE_PARAGRAPHS,
     )
     try:
         blocks, structure_source = parser.parse_json_file(json_path)
@@ -564,6 +566,7 @@ def _index_structural_document(
         structure_source=structure_source,
     )
     result.metrics.parse_time_s = parse_time_s
+    result.metrics.cross_page_merges = getattr(parser, "cross_page_merges", 0)
     chunk_time_s = time.perf_counter() - t_chunk
     chunks = result.chunks
     log.info("[index] '%s': %d chunk(s) (%s) em %.3fs.", doc_id, len(chunks), strategy, chunk_time_s)
@@ -683,6 +686,23 @@ def _structural_payload(
         "page_start": chunk.page_start,
         "page_end": chunk.page_end,
         "page_numbers": chunk.page_numbers,
+        # --- Política v2 (§22): classificação/recuperação + página impressa ---
+        "normalized_content_type": chunk.normalized_content_type,
+        "section_kind": chunk.section_kind,
+        "retrieval_profile": chunk.retrieval_profile or None,
+        "searchable_by_default": chunk.searchable_by_default,
+        "ranking_weight": chunk.ranking_weight,
+        "is_table": chunk.is_table,
+        "is_chart": chunk.is_chart,
+        "is_reference": chunk.is_reference,
+        "is_appendix": chunk.is_appendix,
+        "printed_page_start": chunk.printed_page_start,
+        "printed_page_end": chunk.printed_page_end,
+        "printed_page_numbers": chunk.printed_page_numbers or None,
+        "semantic_completeness": chunk.semantic_completeness,
+        "cross_page_merged": chunk.cross_page_merged,
+        "quality_score": chunk.quality_score,
+        "source_block_ids": chunk.block_ids or None,
         "chunking_strategy": chunk.chunking_strategy,
         "chunking_version": chunk.chunking_version,
         "chunking_config_hash": chunk.chunking_config_hash,

@@ -38,9 +38,10 @@ class FakeSemanticSearch:
         self.ensure_connected_calls += 1
         return self._connected
 
-    async def search(self, query, limit=10, doc_id=None, uuid=None, type="hybrid"):
+    async def search(self, query, limit=10, doc_id=None, uuid=None, type="hybrid", profile=""):
         self.search_calls.append(
-            {"query": query, "limit": limit, "doc_id": doc_id, "uuid": uuid, "type": type}
+            {"query": query, "limit": limit, "doc_id": doc_id, "uuid": uuid,
+             "type": type, "profile": profile}
         )
         return self._results
 
@@ -103,7 +104,8 @@ def test_semantic_forwards_query_params_to_search():
     assert resp.status_code == 200
     assert len(fake.search_calls) == 1
     call = fake.search_calls[0]
-    assert call == {"query": "meta", "limit": 25, "doc_id": "a.pdf", "uuid": "u-9", "type": "dense"}
+    assert call == {"query": "meta", "limit": 25, "doc_id": "a.pdf", "uuid": "u-9",
+                    "type": "dense", "profile": ""}
 
 
 def test_semantic_empty_filters_become_none():

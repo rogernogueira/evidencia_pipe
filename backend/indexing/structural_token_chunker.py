@@ -24,10 +24,13 @@ from typing import Any, Callable, Optional
 from backend.core import config as settings
 from backend.indexing.chunk_models import (
     BLOCK_FIGURE_CAPTION,
+    BLOCK_FORMULA,
     BLOCK_HEADING,
     BLOCK_LIST,
     BLOCK_REFERENCE,
     BLOCK_TABLE,
+    FRONT_MATTER_SECTION_KINDS,
+    NAVIGATION_SECTION_KINDS,
     ChunkingMetrics,
     ChunkingResult,
     ChunkSizeValidationError,
@@ -37,7 +40,12 @@ from backend.indexing.chunk_models import (
     make_chunk_id,
 )
 from backend.indexing.chunk_quality_filters import FilterOutcome
+from backend.indexing.cross_page_reconstruction import block_pages, block_printed_pages
+from backend.indexing.retrieval_profile import classify_retrieval
 from backend.indexing.token_counter import TokenCounter, get_token_counter
+
+# Seções pré-textuais/navegação puladas do chunking quando front_matter_mode=metadata_only.
+_FRONT_MATTER_SKIP_KINDS = FRONT_MATTER_SECTION_KINDS | NAVIGATION_SECTION_KINDS
 
 # Divisão em sentenças tolerante ao português (mantém a pontuação final).
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?=[A-ZÀ-Ú0-9\"'(\[])")
@@ -59,6 +67,10 @@ class ChunkingConfig:
     embed_document_title: bool = settings.CHUNK_EMBED_DOCUMENT_TITLE
     embed_section_context: bool = settings.CHUNK_EMBED_SECTION_CONTEXT
     references_mode: str = settings.CHUNK_REFERENCES_MODE
+    front_matter_mode: str = settings.CHUNK_FRONT_MATTER_MODE
+    appendix_mode: str = settings.CHUNK_APPENDIX_MODE
+    equation_mode: str = settings.CHUNK_EQUATION_MODE
+    equation_min_confidence: float = settings.CHUNK_EQUATION_MIN_CONFIDENCE
     chunking_version: str = settings.CHUNKING_VERSION
 
     def hashable(self) -> dict[str, Any]:
@@ -74,6 +86,10 @@ class ChunkingConfig:
             "embed_document_title": self.embed_document_title,
             "embed_section_context": self.embed_section_context,
             "references_mode": self.references_mode,
+            "front_matter_mode": self.front_matter_mode,
+            "appendix_mode": self.appendix_mode,
+            "equation_mode": self.equation_mode,
+            "equation_min_confidence": self.equation_min_confidence,
             "chunking_version": self.chunking_version,
         }
 
@@ -130,6 +146,26 @@ class StructuralTokenChunker:
     # -- helpers de token ---------------------------------------------------
     def _count(self, text: str) -> int:
         return self.tokens.count(text)
+
+    # -- fronteiras de estado do bloco (§5/§6/§15) --------------------------
+    def _should_chunk(self, b: DocumentBlock) -> bool:
+        """Decide se um bloco entra no chunking. Default v1: só exclui furniture.
+
+        v2 (via config): pula pré-textuais/navegação (front_matter_mode=metadata_only)
+        e referências (references_mode exclude|metadata_only)."""
+        if not b.chunkable:
+            return False
+        if (self.cfg.front_matter_mode == "metadata_only"
+                and b.section_kind in _FRONT_MATTER_SKIP_KINDS):
+            return False
+        if b.block_type == BLOCK_REFERENCE and self.cfg.references_mode in ("exclude", "metadata_only"):
+            return False
+        # §9: equação inline suspeita (ordinal/símbolo mal lido) fora do embedding.
+        if (b.block_type == BLOCK_FORMULA and self.cfg.equation_mode == "merge_with_context"
+                and b.equation_confidence is not None
+                and b.equation_confidence < self.cfg.equation_min_confidence):
+            return False
+        return True
 
     # ------------------------------------------------------------------ API
     def chunk(
@@ -211,6 +247,11 @@ class StructuralTokenChunker:
                 pending_level = b.heading_level
                 continue
 
+            # v2: pula blocos não-chunkáveis (furniture §6) e pré-textuais/navegação
+            # quando front_matter_mode=metadata_only (§5). Refs tratadas abaixo.
+            if not self._should_chunk(b):
+                continue
+
             # Blocos standalone (não se misturam ao grupo de parágrafos).
             if b.block_type == BLOCK_TABLE:
                 flush()
@@ -227,8 +268,6 @@ class StructuralTokenChunker:
             if b.block_type == BLOCK_REFERENCE and self.cfg.references_mode == "separate":
                 flush()
                 drafts.extend(self._chunks_from_references([b]))
-                continue
-            if b.block_type == BLOCK_REFERENCE and self.cfg.references_mode == "exclude":
                 continue
 
             # Parágrafo/quote/formula/footnote/reference(include): entram no grupo.
@@ -552,6 +591,12 @@ class StructuralTokenChunker:
         outcome = self._filter(draft.text, draft.content_type, token_count, draft.section_path)
         return outcome.approved, outcome.reason, outcome.quality
 
+    @staticmethod
+    def _looks_complete(text: str) -> bool:
+        """Heurística leve de completude semântica (§22): termina em pontuação final."""
+        t = (text or "").rstrip()
+        return bool(t) and t[-1] in ".!?…”\")"
+
     def _contextualize(self, text: str, document_title: Optional[str], section_path: list[str]) -> Optional[str]:
         cfg = self.cfg
         parts: list[str] = []
@@ -581,7 +626,23 @@ class StructuralTokenChunker:
         contextualized = self._contextualize(draft.text, document_title, draft.section_path)
         embedding_token_count = self._count(contextualized) if contextualized else token_count
 
-        pages = sorted({b.page_number for b in draft.blocks if b.page_number is not None})
+        # Inclui páginas de reconstrução cross-page (§7) além da página do bloco.
+        pages = sorted({p for b in draft.blocks for p in block_pages(b)})
+        printed_pages = sorted({p for b in draft.blocks for p in block_printed_pages(b)})
+
+        # --- Classificação de recuperação (§21/§22) ---
+        section_kind = next((b.section_kind for b in draft.blocks if b.section_kind), None)
+        origin = draft.extra_meta.get("origin") or (
+            draft.blocks[0].metadata.get("origin") if draft.blocks else None
+        )
+        rc = classify_retrieval(draft.content_type, section_kind, origin=origin)
+        cross_page_merged = any(getattr(b, "cross_page_merged", False) for b in draft.blocks)
+        quality_score = quality.get("quality_score") if quality else None
+        semantic_completeness = (
+            self._looks_complete(draft.text)
+            if draft.content_type in ("paragraph", "references") else None
+        )
+
         chunk_id = make_chunk_id(
             document_id=document_id, bitstream_uuid=bitstream_uuid,
             document_checksum=document_checksum, chunking_version=cfg.chunking_version,
@@ -600,6 +661,19 @@ class StructuralTokenChunker:
             section_path=draft.section_path, heading_level=draft.heading_level,
             page_start=pages[0] if pages else None, page_end=pages[-1] if pages else None,
             page_numbers=pages,
+            printed_page_start=printed_pages[0] if printed_pages else None,
+            printed_page_end=printed_pages[-1] if printed_pages else None,
+            printed_page_numbers=printed_pages,
+            section_kind=section_kind,
+            normalized_content_type=rc.normalized_content_type,
+            retrieval_profile=rc.retrieval_profile,
+            searchable_by_default=rc.searchable_by_default,
+            ranking_weight=rc.ranking_weight,
+            is_table=rc.is_table, is_chart=rc.is_chart,
+            is_reference=rc.is_reference, is_appendix=rc.is_appendix,
+            quality_score=quality_score,
+            semantic_completeness=semantic_completeness,
+            cross_page_merged=cross_page_merged,
             overlap_token_count=draft.overlap_token_count,
             overlap_source_chunk_id=prev_id if draft.overlap_token_count else None,
             split_reason=draft.split_reason, split_method=draft.split_method,
