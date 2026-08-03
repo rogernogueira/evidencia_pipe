@@ -22,10 +22,12 @@ from qdrant_client.models import (
     MatchAny,
     MatchValue,
     Prefetch,
+    Range,
     SparseVector,
 )
 
 from backend.core.config import (
+    CHUNK_CHART_MIN_CONFIDENCE,
     DENSE_MODEL,
     QDRANT_COLLECTION,
     QDRANT_TIMEOUT_SECONDS,
@@ -170,6 +172,10 @@ class SemanticSearch:
                 p_must, p_must_not = _profile_conditions(resolved)
                 conditions.extend(p_must)
                 must_not.extend(p_must_not)
+                # §11: dados visuais de baixa confiança fora de QUALQUER perfil (global).
+                if SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA:
+                    must_not.append(FieldCondition(
+                        key="chart_data_confidence", range=Range(lt=CHUNK_CHART_MIN_CONFIDENCE)))
                 log_api.info("search profile=%r (resolvido de %r)", resolved, explicit or "auto")
 
             query_filter = (

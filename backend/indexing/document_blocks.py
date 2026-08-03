@@ -80,6 +80,14 @@ def _norm_ws(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def _fonte(footnote: str) -> str:
+    """Prefixa 'Fonte:' à nota, sem duplicar quando ela já começa com 'Fonte:'."""
+    f = (footnote or "").strip()
+    if not f:
+        return ""
+    return f if re.match(r"(?i)^fonte\s*:", f) else f"Fonte: {f}"
+
+
 def _inline_to_text(items: Any) -> str:
     """Concatena uma lista de itens inline `{type, content}` em texto plano.
 
@@ -320,7 +328,7 @@ class MinerUDocumentParser:
         if table_md:
             parts.append(table_md)
         if footnote:
-            parts.append(f"Fonte: {footnote}")
+            parts.append(_fonte(footnote))
         text = "\n".join(parts).strip()
         if not text:
             return None
@@ -370,10 +378,10 @@ class MinerUDocumentParser:
         }
         if looks_tabular and trust_data:
             meta["table_markdown"] = body
-            parts = [p for p in (caption, body, (f"Fonte: {footnote}" if footnote else "")) if p]
+            parts = [p for p in (caption, body, _fonte(footnote)) if p]
             return {**base, "type": BLOCK_TABLE, "text": "\n".join(parts).strip(), "meta": meta}
         # Gráfico não confiável (ou não tabular): embedda só legenda + fonte (§11).
-        parts = [p for p in (caption, (f"Fonte: {footnote}" if footnote else "")) if p]
+        parts = [p for p in (caption, _fonte(footnote)) if p]
         text = "\n".join(parts).strip()
         if not text:
             return None
@@ -397,7 +405,7 @@ class MinerUDocumentParser:
             description = raw_content
 
         # Texto embeddável (§12/§20): legenda + descrição (nunca URI/código bruto).
-        parts = [p for p in (caption, description, (f"Fonte: {footnote}" if footnote else "")) if p]
+        parts = [p for p in (caption, description, _fonte(footnote)) if p]
         text = "\n".join(parts).strip() or (caption or Path(img_path).name if img_path else "")
         if not text:
             return None
