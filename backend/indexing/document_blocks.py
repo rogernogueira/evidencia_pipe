@@ -535,7 +535,7 @@ class MinerUDocumentParser:
 
             kind = sm.current
             effective_type = b_type
-            if kind == SECTION_BIBLIOGRAPHY and b_type in (BLOCK_PARAGRAPH, BLOCK_LIST):
+            if kind == SECTION_BIBLIOGRAPHY and b_type in (BLOCK_PARAGRAPH, BLOCK_LIST, BLOCK_FOOTNOTE):
                 effective_type = BLOCK_REFERENCE
 
             # Dicionário de siglas (§5): coleta pares de listas/parágrafos da seção.

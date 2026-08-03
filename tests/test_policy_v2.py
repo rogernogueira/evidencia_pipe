@@ -79,6 +79,17 @@ def test_state_machine_full_document_flow():
         assert kind == expected, f"{text!r} → {kind} (esperado {expected})"
 
 
+def test_nested_references_inside_appendix_does_not_leak():
+    """Referências ANINHADA num apêndice não contamina o conteúdo seguinte (bug real)."""
+    sm = SectionStateMachine()
+    sm.feed_heading("1 Introdução", None)                       # body
+    sm.feed_heading("Apêndice A – Modelo econométrico", None)   # analytical_appendix
+    _, k_ref = sm.feed_heading("Referências", None)             # biblio (transiente)
+    _, k_after = sm.feed_heading("A.5 Respostas às perguntas", None)
+    assert k_ref == SECTION_BIBLIOGRAPHY
+    assert k_after == SECTION_ANALYTICAL_APPENDIX               # voltou ao apêndice, não ficou biblio
+
+
 def test_body_paragraph_before_and_after_first_numbered_heading():
     sm = SectionStateMachine()
     assert sm.current == SECTION_FRONT_MATTER          # capa
@@ -238,9 +249,12 @@ def test_parser_marks_raw_text():
 # --------------------------------------------------------------------------
 
 def _cfg(**kw):
+    # Fixa os modos em v1 (isolamento de teste — não depende do .env ambiente).
     base = dict(target_tokens=10, max_tokens=20, min_tokens=3, overlap_tokens=3,
                 max_overlap_tokens=6, table_max_tokens=15, list_max_tokens=12,
-                force_split_above_tokens=40, chunking_version="v2test")
+                force_split_above_tokens=40, chunking_version="v2test",
+                front_matter_mode="include", references_mode="separate",
+                appendix_mode="flat", equation_mode="raw", table_mode="always")
     base.update(kw)
     return ChunkingConfig(**base)
 

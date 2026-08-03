@@ -109,15 +109,16 @@ def special_section_kind(text: str) -> Optional[str]:
     return None
 
 
-# Seções "grudentas" — uma vez iniciadas, persistem por títulos sem número/rótulo até
-# o próximo título especial ou numerado.
-_STICKY_KINDS = frozenset({
-    SECTION_BIBLIOGRAPHY, SECTION_ANALYTICAL_APPENDIX, SECTION_ADMINISTRATIVE_APPENDIX,
-})
+_APPENDIX_KINDS = frozenset({SECTION_ANALYTICAL_APPENDIX, SECTION_ADMINISTRATIVE_APPENDIX})
 
 
 class SectionStateMachine:
     """Percorre os títulos em ordem e mantém o `section_kind` corrente (§4).
+
+    Distingue o CONTEXTO BASE (front_matter → body → apêndice; grudento, atravessa
+    subtítulos) do estado TRANSIENTE (bibliografia/navegação; dura só até o próximo
+    título). Assim uma seção "Referências" ANINHADA num apêndice não contamina o
+    conteúdo seguinte do apêndice — o próximo título comum volta ao contexto base.
 
     Uso pelo parser:
         sm = SectionStateMachine()
@@ -127,7 +128,8 @@ class SectionStateMachine:
     """
 
     def __init__(self) -> None:
-        # Antes do primeiro título numerado, o conteúdo é pré-textual (capa, ficha…).
+        # base = contexto estrutural grudento; current = o que vale para os blocos.
+        self.base: str = SECTION_FRONT_MATTER
         self.current: str = SECTION_FRONT_MATTER
         self._body_started = False
 
@@ -136,22 +138,25 @@ class SectionStateMachine:
         level = infer_heading_level(text, mineru_level)
         special = special_section_kind(text)
 
-        if special is not None:
-            # Seção especial/navegação inicia aqui.
-            self.current = special
-        elif _is_numbered(text):
-            # Primeiro título numerado encerra o front-matter e inicia o corpo.
+        if special == SECTION_BIBLIOGRAPHY:
+            self.current = SECTION_BIBLIOGRAPHY          # transiente (não muda a base)
+        elif special in _APPENDIX_KINDS:
+            self.base = special                          # apêndice vira a base (grudenta)
             self._body_started = True
-            self.current = SECTION_BODY
+            self.current = special
+        elif special is not None:
+            self.current = special                       # navegação/sumário/siglas (transiente)
+        elif _is_numbered(text):
+            # Título numerado inicia/continua o corpo — a menos que já estejamos num
+            # apêndice (que pode ter numeração própria).
+            if self.base not in _APPENDIX_KINDS:
+                self.base = SECTION_BODY
+            self._body_started = True
+            self.current = self.base
         else:
-            # Título comum sem número: mantém seção grudenta (biblio/apêndice); caso
-            # contrário, corpo (se já iniciado) ou front-matter (pré-textual).
-            if self.current in _STICKY_KINDS:
-                pass  # mantém
-            elif self._body_started:
-                self.current = SECTION_BODY
-            else:
-                self.current = SECTION_FRONT_MATTER
+            # Título comum sem número: volta ao contexto base (encerra biblio/navegação).
+            self.base = self.base if self._body_started else SECTION_FRONT_MATTER
+            self.current = self.base
         return level, self.current
 
 

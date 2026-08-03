@@ -14,9 +14,12 @@ from backend.indexing.token_counter import WhitespaceTokenCounter
 
 
 def _cfg(**kw):
+    # Fixa os modos em v1 (isolamento de teste — não depende do .env ambiente).
     base = dict(target_tokens=10, max_tokens=20, min_tokens=3, overlap_tokens=3,
                 max_overlap_tokens=6, table_max_tokens=15, list_max_tokens=12,
-                force_split_above_tokens=40, chunking_version="test-v1")
+                force_split_above_tokens=40, chunking_version="test-v1",
+                front_matter_mode="include", references_mode="separate",
+                appendix_mode="flat", equation_mode="raw", table_mode="always")
     base.update(kw)
     return ChunkingConfig(**base)
 
