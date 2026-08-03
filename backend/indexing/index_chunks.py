@@ -542,6 +542,10 @@ def _index_structural_document(
         keep_footnotes=settings.CHUNK_KEEP_FOOTNOTES,
         normalize_text=settings.CHUNK_NORMALIZE_TEXT,
         reconstruct_cross_page=settings.MINERU_RECONSTRUCT_CROSS_PAGE_PARAGRAPHS,
+        chart_mode=settings.CHUNK_CHART_MODE,
+        image_mode=settings.CHUNK_IMAGE_MODE,
+        chart_min_confidence=settings.CHUNK_CHART_MIN_CONFIDENCE,
+        visual_llm=settings.CHUNK_VISUAL_LLM,
     )
     try:
         blocks, structure_source = parser.parse_json_file(json_path)
@@ -696,6 +700,10 @@ def _structural_payload(
         "is_chart": chunk.is_chart,
         "is_reference": chunk.is_reference,
         "is_appendix": chunk.is_appendix,
+        # §10/§11/§12: sinais de validação visual (observabilidade/filtro).
+        "table_quality_score": (chunk.metadata or {}).get("table_quality_score"),
+        "chart_data_confidence": (chunk.metadata or {}).get("chart_data_confidence"),
+        "image_kind": (chunk.metadata or {}).get("image_kind"),
         "printed_page_start": chunk.printed_page_start,
         "printed_page_end": chunk.printed_page_end,
         "printed_page_numbers": chunk.printed_page_numbers or None,

@@ -400,3 +400,89 @@ def test_parser_flags_populate_raw_and_normalized():
     b = blocks[0]
     assert b.raw_text == "texto   com    espaços  redundantes."
     assert b.text == "texto com espaços redundantes."
+
+
+# --------------------------------------------------------------------------
+# §10/§11/§12 — Validação visual (Fase 3)
+# --------------------------------------------------------------------------
+
+from backend.indexing.visual_validation import (  # noqa: E402
+    chart_data_confidence,
+    classify_image,
+    image_is_indexable,
+    mermaid_to_text,
+    table_quality_score,
+    table_row_representation,
+)
+
+
+def test_chart_geo_incoherence_zeroes_confidence():
+    conf, reason = chart_data_confidence(
+        "Distribuição de subsídio por unidade federativa do Brasil", "Fonte: RFB",
+        "Colômbia 30; Argentina 25; Chile 20; Peru 15")
+    assert conf == 0.0 and reason == "geo_incoherent_foreign_countries"
+
+
+def test_chart_coherent_has_high_confidence():
+    conf, _ = chart_data_confidence("Cálculo do subsídio por faixa", "", "aliq 7,5% base 33.919")
+    assert conf >= 0.8
+
+
+def test_table_quality_context_matters():
+    html = "<table><tr><td>Ano</td><td>Subsídio</td></tr><tr><td>2019</td><td>4,15</td></tr></table>"
+    good, _ = table_quality_score(html, "Tabela 4: subsídio", "Fonte: SECAP", "body")
+    poor, _ = table_quality_score(html, "", "", "table_of_contents")
+    assert good >= 0.75 and poor < good
+
+
+def test_table_row_representation():
+    md = "| Ano | Subsídio |\n| --- | --- |\n| 2019 | R$ 4,15 bi |"
+    rep = table_row_representation(md, "Tabela 4")
+    assert "Ano: 2019" in rep and "Subsídio: R$ 4,15 bi" in rep
+
+
+def test_image_classification_and_indexability():
+    assert classify_image("Figura 6", "```mermaid\ngraph LR\n A-->B", "") == "flowchart"
+    assert classify_image("", "", "images/logo_gov.jpg") == "logo"
+    assert classify_image("", "", "images/x.jpg") == "decorative"
+    assert image_is_indexable("flowchart", "Figura 6", "Diagrama de fluxo…") is True
+    assert image_is_indexable("logo", "Marca", "algo") is False
+
+
+def test_mermaid_to_text_extracts_labels():
+    txt = mermaid_to_text('graph LR\n A["Gestão fiscal"] --> B["Execução"]')
+    assert "Gestão fiscal" in txt and "Execução" in txt
+
+
+def _chart_block(order, caption, body, section=("2 Análise",), kind=SECTION_BODY):
+    return DocumentBlock(
+        block_id=f"block-{order:04d}", block_type="figure_caption",
+        text=f"{caption}\n{body}", order_index=order, page_number=1,
+        section_path=list(section), section_kind=kind,
+        metadata={"origin": "chart", "chart_data_confidence": 0.0, "figure_caption": caption},
+    )
+
+
+def test_chunker_conditional_table_skips_low_quality():
+    # Tabela sem legenda numa seção de navegação → quality baixa → conditional pula.
+    b = DocumentBlock(
+        block_id="block-0001", block_type="table", text="| a | b |\n| 1 | 2 |",
+        order_index=1, page_number=1, section_path=["Sumário"],
+        section_kind=SECTION_TABLE_OF_CONTENTS,
+        metadata={"table_markdown": "| a | b |\n| 1 | 2 |", "table_html": ""})
+    # Sem legenda e fora do corpo → score ~0.6; com limiar policy-strict (0.75) é pulada.
+    res = _chunker(table_mode="conditional", table_min_quality=0.75).chunk([b], document_id="d")
+    assert res.metrics.rejected_by_reason.get("table_low_quality", 0) == 1
+    assert not res.chunks
+
+
+def test_chunker_conditional_keeps_table_with_caption_in_body():
+    b = DocumentBlock(
+        block_id="block-0001", block_type="table",
+        text="Tabela 4: subsídio\n| Ano | Subsídio |\n| --- | --- |\n| 2019 | 4,15 |",
+        order_index=1, page_number=1, section_path=["2 Análise"], section_kind=SECTION_BODY,
+        metadata={"table_markdown": "| Ano | Subsídio |\n| --- | --- |\n| 2019 | 4,15 |",
+                  "table_caption": "Tabela 4: subsídio", "table_footnote": "Fonte: SECAP",
+                  "table_html": "<table><tr><td>Ano</td><td>Subsídio</td></tr><tr><td>2019</td><td>4,15</td></tr></table>"})
+    res = _chunker(table_mode="conditional", table_min_quality=0.75).chunk([b], document_id="d")
+    assert len(res.chunks) == 1 and res.chunks[0].is_table

@@ -51,6 +51,12 @@ from backend.indexing.chunk_models import (
 from backend.indexing.cross_page_reconstruction import reconstruct_cross_page
 from backend.indexing.section_classifier import SectionStateMachine, parse_acronym_line
 from backend.indexing.text_normalization import normalize_text as _normalize
+from backend.indexing.visual_validation import (
+    chart_data_confidence,
+    classify_image,
+    image_is_indexable,
+    mermaid_to_text,
+)
 
 # Header/footer é considerado "repetido" quando o MESMO texto normalizado aparece
 # em pelo menos este número de páginas (ou fração das páginas, o que for menor).
@@ -112,6 +118,10 @@ class MinerUDocumentParser:
         images_base_uri: str = "",
         normalize_text: bool = False,
         reconstruct_cross_page: bool = False,
+        chart_mode: str = "raw",
+        image_mode: str = "always",
+        chart_min_confidence: float = 0.8,
+        visual_llm: bool = False,
     ) -> None:
         self.remove_repeated_headers = remove_repeated_headers
         self.remove_repeated_footers = remove_repeated_footers
@@ -120,6 +130,11 @@ class MinerUDocumentParser:
         # Política v2: normalização de texto (§8) e reconstrução cross-page (§7).
         self.normalize_text = normalize_text
         self.reconstruct_cross_page = reconstruct_cross_page
+        # Política v2: validação de gráfico (§11) e imagem (§12).
+        self.chart_mode = chart_mode
+        self.image_mode = image_mode
+        self.chart_min_confidence = chart_min_confidence
+        self.visual_llm = visual_llm
         # Métricas preenchidas durante o parse (lidas pelo chunker).
         self.removed_header_blocks = 0
         self.removed_footer_blocks = 0
@@ -316,6 +331,8 @@ class MinerUDocumentParser:
                 "table_caption": caption or None,
                 "table_type": content.get("table_type"),
                 "table_markdown": table_md,
+                "table_html": html or None,          # §10.1: fonte do quality score
+                "table_footnote": footnote or None,
                 "image_uri": self._image_uri(img_path),
             },
         }
@@ -326,40 +343,73 @@ class MinerUDocumentParser:
         footnote = _inline_to_text(content.get("chart_footnote", []))
         body = content.get("content", "")
         body = body.strip() if isinstance(body, str) else ""
-        # Charts frequentemente trazem uma tabela markdown em `content` → tratamos
-        # como tabela (dados reais). Sem corpo tabular, vira legenda de figura.
         looks_tabular = "|" in body and "---" in body
-        parts = [p for p in (caption, body, (f"Fonte: {footnote}" if footnote else "")) if p]
+        img_path = ((content.get("image_source") or {}).get("path") or "")
+
+        # §11: confiança do dado extraído vs legenda/contexto. No modo caption_context,
+        # dado abaixo do limiar NÃO entra no embedding — só legenda + fonte.
+        confidence, reason = chart_data_confidence(caption, footnote, body)
+        # Gate de LLM opcional (§11): refina a confiança. No-op se desligado/sem chave.
+        if self.visual_llm and body:
+            try:
+                from backend.services.llm_visual_service import judge_chart
+                verdict = judge_chart(caption, footnote, body)
+                if verdict is not None:
+                    confidence, reason = verdict[0], f"llm:{verdict[1]}"
+            except Exception:  # noqa: BLE001
+                pass
+        trust_data = self.chart_mode != "caption_context" or confidence >= self.chart_min_confidence
+
+        meta = {
+            "table_caption": caption or None,
+            "figure_caption": caption or None,
+            "image_uri": self._image_uri(img_path),
+            "origin": "chart",
+            "chart_data_confidence": confidence,
+            "chart_confidence_reason": reason,
+        }
+        if looks_tabular and trust_data:
+            meta["table_markdown"] = body
+            parts = [p for p in (caption, body, (f"Fonte: {footnote}" if footnote else "")) if p]
+            return {**base, "type": BLOCK_TABLE, "text": "\n".join(parts).strip(), "meta": meta}
+        # Gráfico não confiável (ou não tabular): embedda só legenda + fonte (§11).
+        parts = [p for p in (caption, (f"Fonte: {footnote}" if footnote else "")) if p]
         text = "\n".join(parts).strip()
         if not text:
             return None
-        img_path = ((content.get("image_source") or {}).get("path") or "")
-        return {
-            **base,
-            "type": BLOCK_TABLE if looks_tabular else BLOCK_FIGURE_CAPTION,
-            "text": text,
-            "meta": {
-                "table_caption": caption or None,
-                "figure_caption": caption or None,
-                "table_markdown": body if looks_tabular else None,
-                "image_uri": self._image_uri(img_path),
-                "origin": "chart",
-            },
-        }
+        return {**base, "type": BLOCK_FIGURE_CAPTION, "text": text, "meta": meta}
 
     def _parse_image(self, content: Any, base: dict) -> Optional[dict]:
         content = content or {}
-        desc = content.get("content", "")
-        desc = desc.strip() if isinstance(desc, str) else ""
+        raw_content = content.get("content", "")
+        raw_content = raw_content.strip() if isinstance(raw_content, str) else ""
+        caption = _inline_to_text(content.get("image_caption", []))
+        footnote = _inline_to_text(content.get("image_footnote", []))
         img_path = ((content.get("image_source") or {}).get("path") or "")
-        # Não incluímos bytes/base64 (§14) — só a descrição textual e a URI da imagem.
-        text = desc or (Path(img_path).name if img_path else "")
+
+        # §12: classifica a imagem e converte diagrama Mermaid em descrição textual.
+        kind = classify_image(caption, raw_content, img_path)
+        if kind in ("flowchart", "diagram") and "mermaid" in raw_content.lower():
+            description = mermaid_to_text(raw_content)
+        elif kind in ("flowchart", "diagram"):
+            description = mermaid_to_text(raw_content) or raw_content
+        else:
+            description = raw_content
+
+        # Texto embeddável (§12/§20): legenda + descrição (nunca URI/código bruto).
+        parts = [p for p in (caption, description, (f"Fonte: {footnote}" if footnote else "")) if p]
+        text = "\n".join(parts).strip() or (caption or Path(img_path).name if img_path else "")
         if not text:
             return None
-        return {
-            **base, "type": BLOCK_FIGURE_CAPTION, "text": text,
-            "meta": {"image_uri": self._image_uri(img_path), "origin": "image"},
-        }
+
+        meta = {"image_uri": self._image_uri(img_path), "origin": "image",
+                "image_kind": kind, "figure_caption": caption or None}
+        out = {**base, "type": BLOCK_FIGURE_CAPTION, "text": text, "meta": meta}
+        # §12: no modo conditional, imagem sem legenda/conteúdo útil (logo, decorativa)
+        # é preservada mas NÃO chunkável.
+        if self.image_mode == "conditional" and not image_is_indexable(kind, caption, description):
+            out["chunkable"] = False
+        return out
 
     def _image_uri(self, path: str) -> Optional[str]:
         if not path:
@@ -511,6 +561,8 @@ class MinerUDocumentParser:
         # §6: cabeçalho/rodapé/nº de página são preservados, mas não chunkáveis.
         is_furniture = block_type in (BLOCK_HEADER, BLOCK_FOOTER, BLOCK_PAGE_NUMBER)
         meta = raw.get("meta", {}) or {}
+        # Override de chunkabilidade (§12: imagem logo/decorativa em modo conditional).
+        chunkable = raw.get("chunkable", not is_furniture)
         # §8: raw_text = extraído; text = normalizado (só para prosa; lista/tabela/figura/
         # fórmula mantêm a estrutura). Preserva números/datas/moedas.
         normalized = text
@@ -522,6 +574,7 @@ class MinerUDocumentParser:
             text=normalized,
             raw_text=text,
             equation_confidence=meta.get("equation_confidence"),
+            chart_data_confidence=meta.get("chart_data_confidence"),
             order_index=order_index,
             page_number=raw.get("page"),
             page_index=raw.get("page_index"),
@@ -531,9 +584,9 @@ class MinerUDocumentParser:
             section_kind=section_kind,
             normalized_type="page_furniture" if is_furniture else None,
             preserve=True,
-            chunkable=not is_furniture,
-            embeddable=not is_furniture,
-            indexable=not is_furniture,
+            chunkable=chunkable,
+            embeddable=chunkable,
+            indexable=chunkable,
             bbox=[float(x) for x in raw["bbox"]] if isinstance(raw.get("bbox"), list) else None,
             source_reference=raw.get("source"),
             metadata=meta,

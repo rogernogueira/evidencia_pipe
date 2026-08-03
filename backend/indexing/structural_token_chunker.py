@@ -43,6 +43,7 @@ from backend.indexing.chunk_quality_filters import FilterOutcome
 from backend.indexing.cross_page_reconstruction import block_pages, block_printed_pages
 from backend.indexing.retrieval_profile import classify_retrieval
 from backend.indexing.token_counter import TokenCounter, get_token_counter
+from backend.indexing.visual_validation import table_quality_score, table_row_representation
 
 # Seções pré-textuais/navegação puladas do chunking quando front_matter_mode=metadata_only.
 _FRONT_MATTER_SKIP_KINDS = FRONT_MATTER_SECTION_KINDS | NAVIGATION_SECTION_KINDS
@@ -71,6 +72,8 @@ class ChunkingConfig:
     appendix_mode: str = settings.CHUNK_APPENDIX_MODE
     equation_mode: str = settings.CHUNK_EQUATION_MODE
     equation_min_confidence: float = settings.CHUNK_EQUATION_MIN_CONFIDENCE
+    table_mode: str = settings.CHUNK_TABLE_MODE
+    table_min_quality: float = settings.CHUNK_TABLE_MIN_QUALITY
     chunking_version: str = settings.CHUNKING_VERSION
 
     def hashable(self) -> dict[str, Any]:
@@ -90,6 +93,8 @@ class ChunkingConfig:
             "appendix_mode": self.appendix_mode,
             "equation_mode": self.equation_mode,
             "equation_min_confidence": self.equation_min_confidence,
+            "table_mode": self.table_mode,
+            "table_min_quality": self.table_min_quality,
             "chunking_version": self.chunking_version,
         }
 
@@ -433,32 +438,50 @@ class StructuralTokenChunker:
                 break
         return " ".join(acc).strip()
 
-    # -- tabelas (§12) ------------------------------------------------------
+    # -- tabelas (§10/§12) --------------------------------------------------
     def _chunks_from_table(self, b: DocumentBlock) -> list[_Draft]:
         cfg = self.cfg
         caption = b.metadata.get("table_caption")
         table_md = b.metadata.get("table_markdown") or ""
-        full_tokens = self._count(b.text)
         table_id = b.block_id.replace("block", "table")
+
+        # §10.1: score de qualidade. No modo conditional, tabela abaixo do limiar (ex.:
+        # sem legenda e fora do corpo) é preservada mas NÃO indexada.
+        quality, comps = table_quality_score(
+            b.metadata.get("table_html") or "", caption or "",
+            b.metadata.get("table_footnote") or "", b.section_kind, markdown=table_md,
+        )
+        if cfg.table_mode == "conditional" and quality < cfg.table_min_quality:
+            self._metrics.rejected_by_reason["table_low_quality"] = (
+                self._metrics.rejected_by_reason.get("table_low_quality", 0) + 1)
+            return []
 
         base_meta = {
             "table_id": table_id,
             "table_title": caption,
             "image_uri": b.metadata.get("image_uri"),
+            "table_quality_score": quality,
         }
 
-        # Tabela pequena → uma unidade só.
+        # §10.2: no modo conditional, embedda a representação "por linhas" (melhor para
+        # buscas factuais) quando a tabela cabe numa unidade.
+        full_tokens = self._count(b.text)
         if full_tokens <= cfg.table_max_tokens or not table_md:
             self._metrics.table_chunks_count += 1
+            text = b.text
+            if cfg.table_mode == "conditional":
+                row_rep = table_row_representation(table_md, caption or "")
+                if row_rep and self._count(row_rep) <= cfg.table_max_tokens:
+                    text = row_rep
             return [_Draft(
-                text=b.text, content_type="table", blocks=[b],
+                text=text, content_type="table", blocks=[b],
                 section_path=b.section_path, heading_level=b.heading_level,
                 allow_overlap=False,
                 extra_meta={**base_meta, "row_start": 0, "row_end": self._table_rows(table_md),
                             "is_table_continuation": False},
             )]
 
-        # Tabela grande → divide por grupos de linhas, repetindo o cabeçalho (§12).
+        # Tabela grande → divide por grupos de linhas, repetindo o cabeçalho (§10.3).
         return self._split_table_by_rows(b, table_md, caption, base_meta)
 
     @staticmethod
@@ -564,7 +587,7 @@ class StructuralTokenChunker:
             ))
         return drafts
 
-    # -- figuras (§14) ------------------------------------------------------
+    # -- figuras / gráficos / imagens (§11/§12) -----------------------------
     def _chunk_from_figure(self, b: DocumentBlock) -> _Draft:
         fig_id = b.block_id.replace("block", "figure")
         return _Draft(
@@ -573,6 +596,9 @@ class StructuralTokenChunker:
             extra_meta={
                 "figure_id": fig_id,
                 "figure_uri": b.metadata.get("image_uri"),
+                "image_kind": b.metadata.get("image_kind"),
+                "chart_data_confidence": b.metadata.get("chart_data_confidence"),
+                "origin": b.metadata.get("origin"),
             },
         )
 

@@ -283,6 +283,14 @@ MINERU_RECONSTRUCT_CROSS_PAGE_PARAGRAPHS = _as_bool(
 CHUNK_NORMALIZE_TEXT = _as_bool(os.getenv("CHUNK_NORMALIZE_TEXT"), False)
 # §9 — abaixo deste equation_confidence a equação é excluída do embedding (merge_with_context).
 CHUNK_EQUATION_MIN_CONFIDENCE = float(os.getenv("CHUNK_EQUATION_MIN_CONFIDENCE", "0.4"))
+# §10 — tabela abaixo deste table_quality_score não é indexada (CHUNK_TABLE_MODE=conditional).
+CHUNK_TABLE_MIN_QUALITY = float(os.getenv("CHUNK_TABLE_MIN_QUALITY", "0.5"))
+# §11 — dados de gráfico abaixo deste chart_data_confidence NÃO entram no embedding; só
+# legenda + contexto (CHUNK_CHART_MODE=caption_context).
+CHUNK_CHART_MIN_CONFIDENCE = float(os.getenv("CHUNK_CHART_MIN_CONFIDENCE", "0.8"))
+# §11/§12 — gate de LLM para coerência de gráfico e descrição de imagem/diagrama.
+# Desacoplado: sem chave é no-op; default OFF (heurística determinística é o padrão).
+CHUNK_VISUAL_LLM = _as_bool(os.getenv("CHUNK_VISUAL_LLM"), False)
 
 # Modos por seção/tipo (default = comportamento v1).
 #   front_matter: include (v1, entra no fluxo comum) | metadata_only (v2, não chunka)
