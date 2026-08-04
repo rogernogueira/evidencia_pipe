@@ -97,6 +97,8 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 | `GET`  | `/api/files/status/{job_id}` | Status resumido do job (sem artefatos). |
 | `GET`  | `/api/files/result/{job_id}` | **Resumo** do resultado (contagens + `artifact_id`) — não devolve o conteúdo. |
 | `POST` | `/api/files/enrich/{job_id}` | Roda o enrich por LLM (desacoplado) sobre um job (lê o markdown do MinIO); se já indexado, propaga ao Qdrant. |
+| `GET`  | `/api/files/active` | Lista os **jobs em execução** (`na_fila`/`processando`): IDs + resumo (estágio, arquivo, `updated_at`), mais recentes primeiro. |
+| `GET`  | `/api/files/succeeded` | Lista os **últimos jobs bem sucedidos** (concluídos sem `index_error`): IDs + resumo (chunks, indexados, `artifact_id`), mais recentes primeiro. |
 | `GET`  | `/api/files/failures` | Lista os jobs na **fila de falhas** (erro num estágio ou `index_error`), mais recentes primeiro. |
 | `POST` | `/api/files/reprocess/{job_id}` | Re-enfileira a chain de um job que falhou (reusa a origem; `?force=true` reprocessa do zero). |
 | `GET`  | `/internal/artifacts/{pipeline_id}/{document_id}/{artifact_name}/download-url` | URL pré-assinada curta (autorizada via `X-Internal-Token`). |

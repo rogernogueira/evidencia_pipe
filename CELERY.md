@@ -166,6 +166,22 @@ processos, libera a VRAM); o soft limit levanta uma exceção tratável (dispara
 e registra a falha) antes do hard limit; e o hard limit (< `visibility_timeout`) evita que
 o broker reentregue a task a outro worker enquanto a original ainda roda (duplicação).
 
+**Jobs em execução.** Simetricamente, os jobs `na_fila`/`processando` ficam num índice
+`jobs:active` (sorted set, score = instante da entrada) mantido pelo `set_status`: o job
+entra ao ser enfileirado e sai ao concluir ou falhar. `GET /api/files/active?limit=100`
+lista os IDs em execução (mais recentes primeiro) com estágio atual e `updated_at` —
+sem varrer as chaves `job:*`. Entradas órfãs (registro expirado por TTL ou status já
+terminal) são podadas ao listar.
+
+**Jobs bem sucedidos.** Índice `jobs:succeeded` (score = instante da conclusão), também
+mantido pelo `set_status`: o job entra ao ficar `concluido` **sem** `index_error` e sai ao
+ser re-enfileirado ou ao falhar. `GET /api/files/succeeded?limit=100` lista os últimos
+sucessos com contagens (`chunk_count`/`indexed_count`) e `artifact_id`. Atenção: um job
+que extraiu mas falhou ao indexar também termina como `concluido` — porém com
+`index_error` — e por isso NÃO aparece aqui, e sim na fila de falhas. Como os índices são
+derivados do registro **mesclado** do job (não do último `set_status`), o follow-up de
+enrich reescrevendo `concluido` não promove um job com erro de índice a sucesso.
+
 **Fila de falhas (não é um DLQ de broker).** Jobs que falham num estágio (ou concluem com
 `index_error`) entram num índice leve no Redis (`jobs:failed`, sorted set). Consulta e
 reprocessamento:

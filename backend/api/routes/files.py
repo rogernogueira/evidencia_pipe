@@ -36,7 +36,14 @@ from backend.core.schemas import (
 from backend.services import llm_enrich_service as llm_enrich
 from backend.services import pipeline_stages as stages
 from backend.services.dspace_service import resolve_item_pdfs
-from backend.services.job_store import clear_failed, get_job, list_failed, set_status
+from backend.services.job_store import (
+    clear_failed,
+    get_job,
+    list_active,
+    list_failed,
+    list_succeeded,
+    set_status,
+)
 from backend.tasks import baixar_dspace, enrich_after_index, extrair_mineru, indexar_qdrant
 
 router = APIRouter()
@@ -231,6 +238,62 @@ def enrich_job_metadata(
     if ref is None:
         raise HTTPException(status_code=502, detail="Falha no step de LLM: metadados não gerados.")
     return JSONResponse(store.read_json(ref.object_key))
+
+
+@router.get("/api/files/active")
+def list_active_jobs(limit: int = Query(default=100, ge=1, le=1000)) -> JSONResponse:
+    """Lista os **jobs em execução** (mais recentes primeiro): os que estão `na_fila`
+    ou `processando`. Devolve os IDs em `job_ids` e um resumo por job (status, estágio
+    atual, arquivo, último update) — sem artefatos. Jobs concluídos ou com erro saem
+    do índice automaticamente (erros ficam em `GET /api/files/failures`)."""
+    jobs = list_active(limit)
+    return JSONResponse({
+        "count": len(jobs),
+        "job_ids": [j["job_id"] for j in jobs],
+        "jobs": [
+            {
+                "job_id": j["job_id"],
+                "status": j.get("status"),
+                "stage": j.get("stage"),
+                "filename": j.get("filename"),
+                "item_uuid": j.get("item_uuid"),
+                "updated_at": j.get("updated_at"),
+            }
+            for j in jobs
+        ],
+    })
+
+
+@router.get("/api/files/succeeded")
+def list_succeeded_jobs(limit: int = Query(default=100, ge=1, le=1000)) -> JSONResponse:
+    """Lista os **últimos jobs bem sucedidos** (mais recentes primeiro): concluídos e
+    indexados sem erro. Devolve os IDs em `job_ids` e um resumo por job (contagens de
+    chunks/pontos indexados, `artifact_id`, `updated_at`) — sem artefatos. Um job que
+    extraiu mas falhou ao indexar NÃO entra aqui (fica em `GET /api/files/failures`).
+
+    A janela é limitada pelo TTL do job_store (`JOBSTORE_TTL`): jobs cujo registro
+    expirou saem da lista."""
+    jobs = list_succeeded(limit)
+    return JSONResponse({
+        "count": len(jobs),
+        "job_ids": [j["job_id"] for j in jobs],
+        "jobs": [
+            {
+                "job_id": j["job_id"],
+                "status": j.get("status"),
+                "filename": j.get("filename"),
+                "item_uuid": j.get("item_uuid"),
+                "chunk_count": j.get("n_chunks"),
+                "indexed_count": j.get("indexed_count"),
+                "artifact_id": (
+                    f"{j['pipeline_id']}/{j.get('document_id', j['job_id'])}"
+                    if j.get("pipeline_id") else None
+                ),
+                "updated_at": j.get("updated_at"),
+            }
+            for j in jobs
+        ],
+    })
 
 
 @router.get("/api/files/failures")

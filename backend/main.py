@@ -47,9 +47,32 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="evidencia_pipe — DSpace ingestion pipeline", lifespan=lifespan)
 
+# CORS com credenciais: o front (rdapp.comais.uft.edu.br) chama a API com
+# withCredentials=true. Com credenciais, o navegador PROÍBE Access-Control-Allow-Origin=*;
+# é preciso ecoar a origem específica + Allow-Credentials. Por isso listamos as origens
+# conhecidas (+ CORS_ALLOW_ORIGINS no .env) e um regex para os subdomínios institucionais.
+cors_allow_origins = [
+    "http://192.168.105.8",
+    "http://192.168.105.8:8181",
+    "https://rdapp.comais.uft.edu.br",
+    "https://api.rdapp.comais.uft.edu.br",
+    "http://api.rdapp.comais.uft.edu.br",
+    "http://localhost:4000",
+    "http://localhost",
+    "http://127.0.0.1:4000",
+    "http://172.16.24.74:4000",
+    "https://devrdapp.ibict.br",
+]
+
+extra_origins = os.getenv("CORS_ALLOW_ORIGINS", "")
+if extra_origins.strip():
+    cors_allow_origins.extend([o.strip() for o in extra_origins.split(",") if o.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=r"https?://([a-z0-9-]+\.)*(comais\.uft\.edu\.br|ibict\.br)(:\d+)?$",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
