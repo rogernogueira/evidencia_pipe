@@ -10,6 +10,9 @@ Usa WhitespaceTokenCounter para limites determinísticos, sem GPU/transformers.
 import pytest
 
 from backend.indexing.chunk_models import (
+    BLOCK_HEADING,
+    BLOCK_LIST,
+    BLOCK_REFERENCE,
     SECTION_ACRONYM_LIST,
     SECTION_ADMINISTRATIVE_APPENDIX,
     SECTION_ANALYTICAL_APPENDIX,
@@ -242,6 +245,69 @@ def test_parser_marks_raw_text():
     parser = MinerUDocumentParser()
     blocks, _ = parser.parse_json(data)
     assert blocks[0].raw_text == blocks[0].text
+
+
+# --- §15: `reference_list` do MinerU marca referência sem depender da seção -----
+
+def _ref_list(*itens, list_type="reference_list"):
+    return {"type": "list", "content": {
+        "list_type": list_type,
+        "list_items": [
+            {"item_type": "text", "item_content": [{"type": "text", "content": i}]} for i in itens
+        ],
+    }}
+
+
+def test_reference_list_marca_referencia_dentro_da_bibliografia():
+    data = [_page(
+        _title("Referências bibliográficas", level=2),
+        _ref_list("ALVES, M. T. G. School context and educational indicators. 2013."),
+    )]
+    blocks, _ = MinerUDocumentParser().parse_json(data)
+    lista = next(b for b in blocks if b.block_type != BLOCK_HEADING)
+    assert lista.block_type == BLOCK_REFERENCE
+    assert lista.section_kind == SECTION_BIBLIOGRAPHY
+
+
+def test_reference_list_marca_referencia_MESMO_apos_titulo_espurio():
+    """Caso real (EVEX?): fragmento vira `title` e encerra o estado de bibliografia.
+
+    O `section_kind` seguinte volta a `body` — mas o rótulo `reference_list` do próprio
+    MinerU ainda identifica a referência, então ela não é indexada como corpo."""
+    data = [_page(
+        _title("1 Introdução", level=2),
+        _para("Parágrafo do corpo do relatório para iniciar a seção body."),
+        _title("Referências bibliográficas", level=2),
+        _ref_list("ALVES, M. T. G. School context and educational indicators. 2013."),
+        _title("EVEX?", level=2),                       # ← fragmento espúrio
+        _ref_list("FIGUEIREDO, D. et al. Os cavalos também caem. Ensaio, 2018."),
+    )]
+    blocks, _ = MinerUDocumentParser().parse_json(data)
+    depois = [b for b in blocks if "FIGUEIREDO" in b.text]
+    assert len(depois) == 1
+    # O estado de seção REALMENTE quebra — isto não foi corrigido aqui...
+    assert depois[0].section_kind == SECTION_BODY
+    # ...mas o bloco continua sendo reconhecido como referência.
+    assert depois[0].block_type == BLOCK_REFERENCE
+
+
+def test_lista_comum_fora_da_bibliografia_nao_vira_referencia():
+    data = [_page(
+        _title("1 Introdução", level=2),
+        _ref_list("Primeiro item da lista", "Segundo item da lista", list_type="text_list"),
+    )]
+    blocks, _ = MinerUDocumentParser().parse_json(data)
+    lista = next(b for b in blocks if b.block_type != BLOCK_HEADING)
+    assert lista.block_type == BLOCK_LIST
+
+
+def test_list_type_normalizado_preservado_para_o_chunker():
+    """A mudança não pode alterar `meta['list_type']`, que o chunker consome."""
+    data = [_page(_title("Referências", level=2), _ref_list("ALVES, M. Obra citada. 2013."))]
+    blocks, _ = MinerUDocumentParser().parse_json(data)
+    ref = next(b for b in blocks if b.block_type == BLOCK_REFERENCE)
+    assert ref.metadata["list_type"] == "unordered"
+    assert ref.metadata["source_list_type"] == "reference_list"
 
 
 # --------------------------------------------------------------------------

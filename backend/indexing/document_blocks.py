@@ -76,8 +76,18 @@ _MATH_OPERATORS_RE = re.compile(
 _ORDINAL_LIKE_RE = re.compile(r"^\s*[_^]?\s*\{?\s*\d{1,3}\s*[\^_]?\s*\{?\s*[oaºª°0]\s*\}?\s*\}?\s*$")
 
 
+# Rótulo do MinerU para lista de referências bibliográficas (ambos os backends,
+# `pipeline` e `hybrid-engine`, o emitem). Verificado em 3.4.4 e 4.0.0a5.
+_REFERENCE_LIST_TYPE = "reference_list"
+
+
 def _norm_ws(text: str) -> str:
     return " ".join((text or "").split())
+
+
+def _is_reference_list(raw: dict) -> bool:
+    """True quando o próprio MinerU rotulou a lista como bibliográfica."""
+    return (raw.get("meta") or {}).get("source_list_type") == _REFERENCE_LIST_TYPE
 
 
 def _fonte(footnote: str) -> str:
@@ -310,6 +320,11 @@ class MinerUDocumentParser:
             **base, "type": BLOCK_LIST, "text": "\n".join(lines),
             "meta": {
                 "list_type": "ordered" if ordered else "unordered",
+                # `list_type` acima é a forma NORMALIZADA (consumida pelo chunker).
+                # Aqui fica o rótulo original do MinerU ("reference_list",
+                # "text_list", …), que `_assign_sections` usa para reconhecer
+                # referências sem depender do estado de seção.
+                "source_list_type": str(list_type),
                 "list_start_index": 1,
                 "list_end_index": len(lines),
                 "item_count": len(lines),
@@ -543,7 +558,14 @@ class MinerUDocumentParser:
 
             kind = sm.current
             effective_type = b_type
+            # (a) Dentro da bibliografia, prosa/listas/notas são referências (§15).
             if kind == SECTION_BIBLIOGRAPHY and b_type in (BLOCK_PARAGRAPH, BLOCK_LIST, BLOCK_FOOTNOTE):
+                effective_type = BLOCK_REFERENCE
+            # (b) O MinerU rotulou a lista como `reference_list`: sinal DIRETO, que não
+            # depende do estado de seção. Vale mesmo com `kind` fora da bibliografia —
+            # é o que impede que um título espúrio ("EVEX?", que encerra o estado
+            # transiente) transforme as referências seguintes em corpo indexável.
+            elif b_type == BLOCK_LIST and _is_reference_list(b):
                 effective_type = BLOCK_REFERENCE
 
             # Dicionário de siglas (§5): coleta pares de listas/parágrafos da seção.
