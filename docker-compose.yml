@@ -146,6 +146,53 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # MinerU 4.0.0a5 (PRÉ-LANÇAMENTO) — serviço de AVALIAÇÃO, na 8013. Não faz parte
+  # do pipeline: está atrás do profile "mineru-v4", então `docker compose up -d` e o
+  # unit systemd (que lista os serviços por nome) NUNCA o sobem. Produção segue na
+  # 8012 com a 3.4.4 estável.
+  #
+  # Existe para responder com dados se a 4.0 corrige os erros de layout que o
+  # relatório sumário↔títulos expôs (scripts/toc_heading_report.py) — em especial o
+  # fragmento "EVEX?" virando `title` nível 2 no meio das referências.
+  #
+  #   docker compose --profile mineru-v4 build mineru-v4
+  #   docker compose --profile mineru-v4 up -d mineru-v4
+  #   docker compose --profile mineru-v4 down mineru-v4
+  #
+  # Como a de produção, exige --gpus all (count: all): com device único o vLLM falha
+  # com "Device string must not be empty".
+  mineru-v4:
+    profiles: ["mineru-v4"]
+    build:
+      context: ./deploy/mineru-v4
+      args:
+        MINERU_VERSION: "4.0.0a5"
+    image: evidencia_mineru:v4
+    container_name: evidencia_mineru_v4
+    # A 4.0 removeu o entry point `mineru-api` — virou subcomando de `mineru-kit`.
+    # Sem `--preload-models` os modelos carregam sob demanda, que é o equivalente ao
+    # `--enable-vlm-preload false` usado na 8012 (footprint baixo de VRAM).
+    command: ["mineru-kit", "api-server", "--host", "0.0.0.0", "--port", "8010"]
+    environment:
+      MINERU_MODEL_SOURCE: local
+    ports:
+      - "8013:8010"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    # "no": é serviço de avaliação — não deve voltar sozinho no boot.
+    restart: "no"
+
   # ------------------------------------------------------------------------
   # Embedding (estágio 3): bge-m3 servido por vLLM. O backend NÃO carrega mais o
   # modelo — só fala HTTP com estes dois serviços (ver backend/services/embedder.py).
