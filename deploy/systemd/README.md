@@ -10,10 +10,10 @@ num alvo único.
 
 | Arquivo | Papel |
 |---|---|
-| `evidencia-compose.service` | oneshot: `docker compose up -d redis flower minio minio-init mineru-pipeline` (`ExecStop` = `docker compose stop`) |
+| `evidencia-compose.service` | oneshot: `docker compose up -d redis flower minio minio-init mineru-pipeline vllm-bge-m3 vllm-bge-m3-sparse` (`ExecStop` = `docker compose stop`) |
 | `evidencia-api.service` | API FastAPI — `uv run python backend/main.py` (:8181, via `PORT` no `.env`) |
 | `evidencia-worker-light.service` | worker leve — filas `download,extract,llm`, `-c 4` |
-| `evidencia-worker-gpu.service` | worker GPU — fila `gpu`, `-c 1`, `WORKER_ROLE=gpu` (1 cópia do bge-m3 na VRAM) |
+| `evidencia-worker-gpu.service` | worker GPU — fila `gpu`, `-c 1`, `WORKER_ROLE=gpu` (sonda a API de embedding na subida) |
 | `evidencia.target` | alvo agregador dos 4 — sobe/derruba tudo de uma vez |
 
 A API e os workers têm `Requires=`/`After=evidencia-compose.service` (dependem de
@@ -49,5 +49,9 @@ sudo ./uninstall.sh   # para, desabilita e apaga as units (não toca em Docker/d
   sozinho (`load_dotenv` em `backend/core/config.py`).
 - GPU única → sobe **`mineru-pipeline` (:8012)**. Para usar o VLM (`mineru`, :8011),
   edite o `ExecStart` de `evidencia-compose.service`.
+- **API de embedding**: `vllm-bge-m3` (:8000, denso) e `vllm-bge-m3-sparse` (:8001,
+  esparso) sobem junto com a infra. Sem eles a indexação e a busca falham — não há
+  fallback local. São dois porque o servidor HTTP do vLLM fixa uma pooling task por
+  instância (ver `backend/services/embedder.py`).
 - `%%h` nos `-n light@%%h`/`gpu@%%h`: o systemd desescapa para `%h`, que o Celery expande
   como hostname (nome do worker).

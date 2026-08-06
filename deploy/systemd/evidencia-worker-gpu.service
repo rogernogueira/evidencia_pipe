@@ -1,5 +1,7 @@
-# Worker de GPU do evidencia_pipe: fila gpu (embedding bge-m3 + upsert no Qdrant).
-# concurrency=1 e WORKER_ROLE=gpu: UMA cópia do bge-m3 na VRAM. Nunca use -c > 1 (OOM).
+# Worker de GPU do evidencia_pipe: fila gpu (chunking + embedding + upsert no Qdrant).
+# O bge-m3 NÃO roda mais aqui — o embedding é HTTP contra os contêineres vLLM (ver
+# evidencia-compose.service). WORKER_ROLE=gpu faz o worker sondar a API na subida.
+# concurrency=1 continua: a fila serializa o trabalho pesado por documento.
 [Unit]
 Description=evidencia_pipe - worker de GPU (embedding + Qdrant)
 Requires=evidencia-compose.service

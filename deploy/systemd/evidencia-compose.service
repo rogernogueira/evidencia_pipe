@@ -1,8 +1,14 @@
-# Infra Docker do evidencia_pipe (redis, flower, minio, minio-init, mineru-pipeline).
-# Os contêineres já têm restart: unless-stopped; este oneshot garante que sejam
-# subidos no boot e parados no shutdown junto com o resto do stack.
+# Infra Docker do evidencia_pipe (redis, flower, minio, minio-init, mineru-pipeline
+# e os dois serviços vLLM do bge-m3). Os contêineres já têm restart: unless-stopped;
+# este oneshot garante que sejam subidos no boot e parados no shutdown junto com o
+# resto do stack.
+#
+# vllm-bge-m3 (:8000, denso) e vllm-bge-m3-sparse (:8001, esparso) são a API de
+# embedding: sem eles a indexação e a busca falham (não há fallback local). São dois
+# porque o servidor HTTP do vLLM fixa UMA pooling task por instância — ver
+# backend/services/embedder.py.
 [Unit]
-Description=evidencia_pipe - infra Docker (redis, flower, minio, mineru-pipeline)
+Description=evidencia_pipe - infra Docker (redis, flower, minio, mineru-pipeline, vllm-bge-m3)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -12,7 +18,7 @@ PartOf=evidencia.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/app/evidencia_pipe
-ExecStart=/usr/bin/docker compose up -d redis flower minio minio-init mineru-pipeline
+ExecStart=/usr/bin/docker compose up -d redis flower minio minio-init mineru-pipeline vllm-bge-m3 vllm-bge-m3-sparse
 ExecStop=/usr/bin/docker compose stop
 TimeoutStartSec=0
 
