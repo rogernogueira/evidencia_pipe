@@ -42,13 +42,24 @@ EMBED_API_MAX_TOKENS = int(os.getenv("EMBED_API_MAX_TOKENS", "8192"))
 
 # API do MinerU rodando via Docker (container mineru-api, profile "api") — estágio 2.
 MINERU_API_URL = os.getenv("MINERU_API_URL", "http://127.0.0.1:8010")
-# Backend/método/idioma do MinerU (flags -b/-m/-l). Configuráveis para permitir
-# A/B de desempenho x qualidade sem alterar código:
-#   MINERU_BACKEND: hybrid-auto-engine (padrão, VLM — melhor qualidade, mais caro)
+# Backend/método/idioma do MinerU (campos backend/parse_method/lang_list da API).
+# Configuráveis para permitir A/B de desempenho x qualidade sem alterar código:
+#   MINERU_BACKEND: hybrid-engine (padrão, VLM — melhor qualidade, mais caro)
 #                   | pipeline (modelos clássicos, mais rápido/leve) | vlm-* | ...
 #   MINERU_METHOD:  auto (padrão) | txt (PDF nativo digital, pula OCR — rápido) | ocr
 #   MINERU_LANG:    latin (padrão) | ch | en | ...
-MINERU_BACKEND = os.getenv("MINERU_BACKEND", "hybrid-auto-engine").strip()
+#
+# Medido em 06/08/2026 (6 páginas de referências, RTX A6000, MinerU 3.4.4):
+#   pipeline       13s,  ~1,3 GB de VRAM, 24 blocos tipados como referência
+#   hybrid-engine  7,3s, ~25 GB de VRAM, 42 blocos tipados como referência
+# O hybrid tipa referências muito melhor (list_type=reference_list em vez de
+# paragraph solto), o que alimenta a detecção em document_blocks — e, com o VLM já
+# residente, é mais RÁPIDO que o pipeline. O custo é a primeira requisição de cada
+# ciclo do contêiner (~100s carregando o VLM sob demanda) e os ~24 GB de VRAM que
+# o vLLM reserva: sem eles ele ABORTA ("Free memory on device cuda:0 ... is less
+# than desired GPU memory utilization"), não degrada.
+# Nenhum dos dois corrige os falsos títulos (ver backend/indexing/toc_validator.py).
+MINERU_BACKEND = os.getenv("MINERU_BACKEND", "hybrid-engine").strip()
 MINERU_METHOD = os.getenv("MINERU_METHOD", "auto").strip()
 MINERU_LANG = os.getenv("MINERU_LANG", "latin").strip()
 
