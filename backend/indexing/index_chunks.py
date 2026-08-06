@@ -614,6 +614,7 @@ def _index_structural_document(
 
     # --- Build de pontos (FORA do lock) ---
     document_version = f"{document_checksum}:{result.chunking_config_hash}"
+    index_run_id = str(_uuid.uuid4())
     point_ns = _uuid.uuid5(_uuid.NAMESPACE_URL, "evidencia_pipe/chunk")
     points: list[PointStruct] = []
     for chunk, dense, lw in zip(chunks, dense_vecs, lexical_list):
@@ -621,7 +622,7 @@ def _index_structural_document(
         payload = _structural_payload(
             chunk, doc_id=doc_id, doc_name=doc_name, doc_path=doc_path,
             item_uuid=item_uuid, item_handle=item_handle, document_version=document_version,
-            llm_metadata_payload=llm_metadata_payload,
+            index_run_id=index_run_id, llm_metadata_payload=llm_metadata_payload,
         )
         points.append(PointStruct(
             id=str(_uuid.uuid5(point_ns, chunk.chunk_id)),
@@ -635,15 +636,22 @@ def _index_structural_document(
         client.upsert(collection_name=COLLECTION_NAME, points=points[start:start + upsert_batch_size])
     upsert_time_s = time.perf_counter() - t_upsert
 
-    # --- Remove versões ANTIGAS do documento (mesmo doc_name, outra document_version).
-    # Feito APÓS o upsert confirmado dos novos — nunca antes (§27). Falha aqui é
-    # best-effort (não invalida a indexação nova).
+    # --- Remove pontos de execuções ANTERIORES deste documento (mesmo doc_name,
+    # outro index_run_id). Feito APÓS o upsert confirmado dos novos — nunca antes (§27).
+    # Falha aqui é best-effort (não invalida a indexação nova).
+    #
+    # Filtrar por `document_version` NÃO bastava: ele é
+    # `checksum_do_documento:chunking_config_hash`, e nenhum dos dois muda quando o
+    # CÓDIGO do parser muda. Numa reindexação motivada por mudança de código, os novos
+    # chunk_id não colidiam com os antigos e o must_not não casava nada — os pontos
+    # velhos ficavam órfãos na collection (observado: 364 + 351 → 504 pontos no
+    # exames-educ-basica, com 153 órfãos).
     try:
         client.delete(
             collection_name=COLLECTION_NAME,
             points_selector=Filter(
                 must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))],
-                must_not=[FieldCondition(key="document_version", match=MatchValue(value=document_version))],
+                must_not=[FieldCondition(key="index_run_id", match=MatchValue(value=index_run_id))],
             ),
         )
     except Exception as exc:
@@ -666,7 +674,8 @@ def _index_structural_document(
 
 def _structural_payload(
     chunk, *, doc_id: str, doc_name: str, doc_path: str, item_uuid: str,
-    item_handle: str, document_version: str, llm_metadata_payload: dict,
+    item_handle: str, document_version: str, index_run_id: str,
+    llm_metadata_payload: dict,
 ) -> dict:
     """Payload do Qdrant para um StructuralChunk (§26). Sem embeddings/imagens/JSON
     MinerU completo/objetos não serializáveis."""
@@ -674,6 +683,12 @@ def _structural_payload(
 
     payload = {
         "chunk_id": chunk.chunk_id,
+        # Identifica ESTA execução de indexação. É o que permite remover os pontos
+        # de execuções anteriores do mesmo documento mesmo quando document_version
+        # não muda — caso de mudança de CÓDIGO do parser/chunker, que altera as
+        # fronteiras dos chunks (e portanto os chunk_id) sem tocar no checksum do
+        # documento nem no chunking_config_hash.
+        "index_run_id": index_run_id,
         "chunk_index": chunk.chunk_index,
         "document_id": chunk.document_id,
         "item_uuid": item_uuid or chunk.item_uuid,
