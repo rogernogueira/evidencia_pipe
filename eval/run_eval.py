@@ -1,6 +1,7 @@
 """Avaliação fim-a-fim de recuperação: v1 (permissivo) × v2 (política corrigida).
 
-Recupera com BGE-M3 REAL (denso + esparso, fusão RRF k=60), em memória (sem Qdrant).
+Recupera com o BGE-M3 REAL da API vLLM (denso + esparso, fusão RRF k=60), em memória
+(sem Qdrant). Requer os contêineres vllm-bge-m3 / vllm-bge-m3-sparse no ar.
 Relevância por CONTEÚDO da resposta (answer_span contido no chunk) OU sobreposição de
 block_id — independente das fronteiras de chunk, para comparar as formas de modo justo.
 v2 aplica o filtro por perfil de recuperação (intenção da consulta), como em produção.
@@ -70,19 +71,20 @@ def build_chunks(form: str):
 # --------------------------------------------------------------------------
 
 def load_model():
-    from FlagEmbedding import BGEM3FlagModel
-    try:
-        return BGEM3FlagModel("BAAI/bge-m3", use_fp16=True)
-    except Exception:  # noqa: BLE001
-        return BGEM3FlagModel("BAAI/bge-m3", use_fp16=False, device="cpu")
+    """O mesmo embedder da produção (API vLLM). Falha cedo se a API estiver fora —
+    avaliar com um backend diferente do indexado não diz nada."""
+    from backend.services.embedder import BgeM3EmbedderService
+
+    embedder = BgeM3EmbedderService()
+    embedder.health_check(raise_on_error=True)
+    return embedder
 
 
 def encode(model, texts):
-    o = model.encode(texts, batch_size=16, max_length=512,
-                     return_dense=True, return_sparse=True, return_colbert_vecs=False)
-    dense = np.asarray(o["dense_vecs"], dtype=np.float32)
+    dense_list, lexical = model.embed_documents(list(texts), batch_size=16)
+    dense = np.asarray(dense_list, dtype=np.float32)
     dense /= (np.linalg.norm(dense, axis=1, keepdims=True) + 1e-9)   # normaliza p/ cosine
-    return dense, o["lexical_weights"]
+    return dense, lexical
 
 
 def sparse_dot(a: dict, b: dict) -> float:

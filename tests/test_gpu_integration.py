@@ -1,19 +1,18 @@
 """Testes de integração de coordenação de GPU no evidencia_pipe (§40, subconjunto
-testável sem GPU/torch/FlagEmbedding reais). Cobrem:
+testável sem GPU/torch reais). Cobrem:
 
   - MinerU adquire a GPU e mantém o lock durante o subprocesso (mock);
   - MinerU libera o lock após falha do subprocesso (encerrando o grupo de processos);
-  - prioridade: script externo (10) roda antes do BGE (30); nenhum interrompe o MinerU;
-  - ciclo de vida do BGE-M3: descarrega a VRAM quando configurado (BGEModelManager);
+  - prioridade: script externo (10) roda antes de um consumidor comum (15); nenhum
+    interrompe o MinerU;
   - falha do Redis impede a execução CUDA (fail-closed).
 
-Os intervalos de uso da GPU nunca se sobrepõem.
+O bge-m3 não aparece mais aqui: ele roda nos contêineres vLLM (VRAM própria) e não
+disputa o lock do gpu0. Os intervalos de uso da GPU nunca se sobrepõem.
 """
 
-import sys
 import threading
 import time
-import types
 from unittest import mock
 
 import pytest
@@ -126,12 +125,12 @@ def _run(manager, service, priority, hold, order, delay=0.0):
         order.append(("end", service, time.time()))
 
 
-def test_external_priority_runs_before_bge_and_does_not_preempt_mineru(gpu_manager_fake):
+def test_external_priority_runs_before_indexer_and_does_not_preempt_mineru(gpu_manager_fake):
     from backend.core import config as settings
 
     make_peer = gpu_manager_fake._make_peer
     mineru = make_peer()
-    bge = make_peer()
+    outro = make_peer()
     ext = make_peer()
     order = []
 
@@ -139,9 +138,9 @@ def test_external_priority_runs_before_bge_and_does_not_preempt_mineru(gpu_manag
     mineru_lease = mineru.acquire_lease(resource="gpu0", service="mineru", priority=settings.MINERU_GPU_PRIORITY)
     order.append(("start", "mineru", time.time()))
 
-    t_bge = threading.Thread(target=_run, args=(bge, "bge-m3", settings.BGE_GPU_PRIORITY, 0.1, order, 0.1), daemon=True)
+    t_outro = threading.Thread(target=_run, args=(outro, "outro", 15, 0.1, order, 0.1), daemon=True)
     t_ext = threading.Thread(target=_run, args=(ext, "ext", 10, 0.1, order, 0.25), daemon=True)
-    t_bge.start()
+    t_outro.start()
     t_ext.start()
     time.sleep(0.5)
 
@@ -150,7 +149,7 @@ def test_external_priority_runs_before_bge_and_does_not_preempt_mineru(gpu_manag
     order.append(("end", "mineru", time.time()))
     mineru_lease.release()
 
-    t_bge.join(timeout=5)
+    t_outro.join(timeout=5)
     t_ext.join(timeout=5)
 
     # sem sobreposição
@@ -161,7 +160,7 @@ def test_external_priority_runs_before_bge_and_does_not_preempt_mineru(gpu_manag
     assert all(segs[i][1] <= segs[i + 1][0] + 1e-6 for i in range(len(segs) - 1)), segs
     starts = [s for _, _, s in segs]
     assert starts[0] == "mineru"
-    assert starts.index("ext") < starts.index("bge-m3"), starts
+    assert starts.index("ext") < starts.index("outro"), starts
 
 
 def test_redis_failure_blocks_cuda_fail_closed():
@@ -171,76 +170,6 @@ def test_redis_failure_blocks_cuda_fail_closed():
     mgr = GPUResourceManager(cfg)
     cuda_ran = {"flag": False}
     with pytest.raises(GPUBackendUnavailable):
-        with mgr.acquire(resource="gpu0", service="bge-m3", priority=30):
+        with mgr.acquire(resource="gpu0", service="mineru", priority=30):
             cuda_ran["flag"] = True
     assert cuda_ran["flag"] is False
-
-
-# --------------------------------------------------------------------------- #
-# Ciclo de vida do BGE-M3 na VRAM (BGEModelManager) — PyTorch/BGE mockados
-# --------------------------------------------------------------------------- #
-@pytest.fixture
-def fake_torch_and_embedder(monkeypatch):
-    """Instala um módulo torch falso e um backend.services.embedder falso com um
-    'modelo' rastreável (registra to('cuda')/to('cpu') e empty_cache)."""
-    calls = {"to": [], "empty_cache": 0, "synchronize": 0, "ipc_collect": 0}
-
-    inner = types.SimpleNamespace()
-    inner.to = lambda dev: calls["to"].append(dev)
-
-    fake_model = types.SimpleNamespace(model=inner)
-
-    # módulo embedder falso (evita importar FlagEmbedding)
-    emb_mod = types.ModuleType("backend.services.embedder")
-    emb_mod._SHARED_MODEL = fake_model
-
-    class _Embedder:
-        def is_loaded(self):
-            return emb_mod._SHARED_MODEL is not None
-
-        def load_model(self, require_cache=False):
-            return True
-
-    emb_mod.BgeM3EmbedderService = _Embedder
-    monkeypatch.setitem(sys.modules, "backend.services.embedder", emb_mod)
-
-    # torch falso
-    torch_mod = types.ModuleType("torch")
-    cuda_ns = types.SimpleNamespace(
-        is_available=lambda: True,
-        empty_cache=lambda: calls.__setitem__("empty_cache", calls["empty_cache"] + 1),
-        ipc_collect=lambda: calls.__setitem__("ipc_collect", calls["ipc_collect"] + 1),
-        synchronize=lambda: calls.__setitem__("synchronize", calls["synchronize"] + 1),
-    )
-    torch_mod.cuda = cuda_ns
-    monkeypatch.setitem(sys.modules, "torch", torch_mod)
-
-    return calls, emb_mod
-
-
-def test_bge_unloads_vram_when_configured(fake_torch_and_embedder):
-    calls, emb_mod = fake_torch_and_embedder
-    from backend.services.bge_model_manager import BGEModelManager
-
-    mm = BGEModelManager(lifecycle="lazy", unload_after_task=True)
-    mm.move_to_gpu()
-    assert "cuda" in calls["to"]
-    assert mm.on_gpu is True
-
-    mm.release_gpu_if_configured()
-    # sincronizou, descarregou a instância (unload) e limpou o cache CUDA
-    assert calls["synchronize"] >= 1
-    assert calls["empty_cache"] >= 1
-    assert emb_mod._SHARED_MODEL is None  # VRAM liberada (instância removida)
-    assert mm.on_gpu is False
-
-
-def test_bge_cpu_idle_moves_to_cpu_without_unloading(fake_torch_and_embedder):
-    calls, emb_mod = fake_torch_and_embedder
-    from backend.services.bge_model_manager import BGEModelManager
-
-    mm = BGEModelManager(lifecycle="cpu_idle", unload_after_task=False)
-    mm.move_to_gpu()
-    mm.release_gpu_if_configured()
-    assert calls["to"][-1] == "cpu"          # voltou para CPU
-    assert emb_mod._SHARED_MODEL is not None  # NÃO descarregou (mantém em RAM)

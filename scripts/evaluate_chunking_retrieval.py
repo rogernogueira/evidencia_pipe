@@ -99,8 +99,11 @@ def main() -> None:
     from backend.services.embedder import BgeM3EmbedderService
 
     embedder = BgeM3EmbedderService()
-    if not embedder.load_model(require_cache=False):
-        raise SystemExit("Não foi possível carregar o BGE-M3 (necessário para a avaliação).")
+    if not embedder.health_check():
+        raise SystemExit(
+            "API de embedding (vLLM) indisponível — necessária para a avaliação. "
+            "Suba: docker compose up -d vllm-bge-m3 vllm-bge-m3-sparse"
+        )
 
     queries = json.loads(Path(args.queries).read_text(encoding="utf-8"))
     parser = MinerUDocumentParser()

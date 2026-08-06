@@ -96,14 +96,16 @@ class SemanticSearch:
     async def ensure_connected(self) -> bool:
         """Idempotente enquanto disponível; re-tenta enquanto indisponível.
 
-        Exige o bge-m3 no cache local (require_cache=True) para não disparar um
-        download bloqueante dentro da API, e a existência da collection.
+        Exige a API de embedding (contêineres vLLM) no ar e a existência da
+        collection — sem embedar a query não há busca híbrida.
         """
         if self._available:
             return True
 
-        if not self._embedder.load_model(require_cache=True):
-            log.warning("bge-m3 não está no cache local — busca semântica desabilitada.")
+        if not self._embedder.health_check():
+            dense_url, sparse_url = self._embedder.endpoints()
+            log.warning("API de embedding indisponível (dense=%s, sparse=%s) — "
+                        "busca semântica desabilitada.", dense_url, sparse_url)
             self._available = False
             return False
 

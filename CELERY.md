@@ -75,12 +75,13 @@ Rodam no venv do host (GPU + modelos locais). **Dois** workers:
 # Worker leve — download, MinerU e LLM (IO-bound, pode ter concorrência)
 uv run celery -A backend.celery_app worker -Q download,extract,llm -c 4 -E -n light@%h
 
-# Worker de GPU — embedding + upsert no Qdrant.
-# concurrency=1 e WORKER_ROLE=gpu para carregar UMA cópia do bge-m3 na VRAM.
+# Worker de GPU — chunking, embedding (via API vLLM) e upsert no Qdrant.
 WORKER_ROLE=gpu uv run celery -A backend.celery_app worker -Q gpu -c 1 -E -n gpu@%h
 ```
 
-> ⚠️ Nunca rode a fila `gpu` com `-c > 1`: cada processo carregaria o bge-m3 → OOM de VRAM.
+> O bge-m3 não é mais carregado no worker: ele roda nos contêineres `vllm-bge-m3`
+> (denso) e `vllm-bge-m3-sparse` (esparso), e o worker só fala HTTP com eles. Mantemos
+> `-c 1` porque a fila `gpu` ainda serializa trabalho pesado por documento.
 > O `-E` habilita eventos (necessário para o Flower ver as tasks).
 
 ## Coordenação da GPU (gpu_resource_manager)
@@ -89,9 +90,9 @@ WORKER_ROLE=gpu uv run celery -A backend.celery_app worker -Q gpu -c 1 -E -n gpu
 Ele **não** controla o subprocesso do MinerU (outro processo) nem scripts externos
 que também usam CUDA. Quem coordena **todos** os processos é o
 [`gpu_resource_manager`](packages/gpu_resource_manager/) via lock distribuído no
-**Redis DB 2** (`GPU_MANAGER_REDIS_URL`). E a ocupação da VRAM (mesmo sem inferência)
-é controlada pela política de ciclo de vida do modelo (`BGE_GPU_LIFECYCLE`), não pelo
-lock — o lock Redis não libera VRAM sozinho.
+**Redis DB 2** (`GPU_MANAGER_REDIS_URL`). Hoje o único consumidor interno do lock é a
+extração do MinerU: o bge-m3 saiu do lock quando migrou para os contêineres vLLM, que
+têm VRAM própria e reservada (`--gpu-memory-utilization`).
 
 Camadas de controle:
 
@@ -99,20 +100,20 @@ Camadas de controle:
 |--------|----------------|
 | `concurrency=1` (fila `gpu`) | Uma task de GPU por vez **naquele** worker |
 | `worker_prefetch_multiplier=1` | Não "açambarca" tasks longas (já configurado) |
-| `gpu_resource_manager` (Redis DB 2) | Exclusão entre **todos** os processos (MinerU, BGE-M3, scripts externos) |
-| `BGE_GPU_LIFECYCLE` + `BGEModelManager` | Ocupação real da VRAM (descarga após a task) |
+| `gpu_resource_manager` (Redis DB 2) | Exclusão entre **todos** os processos (MinerU, scripts externos) |
+| `--gpu-memory-utilization` dos contêineres vLLM | Teto de VRAM do embedding (fora do lock) |
 
-Preload na VRAM: com a GPU compartilhada (`GPU_SHARED_WITH_MINERU=true`, padrão) o
-worker **não** pré-carrega o bge-m3 na VRAM — o modelo é carregado sob demanda e
-movido para a GPU só sob o lock, sendo descarregado após a task. O preload direto na
-VRAM só ocorre com `BGE_GPU_LIFECYCLE=preload` **e** GPU não compartilhada.
+O worker não pré-carrega nada na VRAM: na subida ele apenas **sonda** a API de
+embedding (`EMBED_API_URL` / `EMBED_API_SPARSE_URL`) e loga o resultado. Se a API
+estiver fora, o worker sobe do mesmo jeito e a task de indexação falha
+explicitamente, com a URL no erro.
 
 Chunking fora do lock (estágio `indexar_qdrant`): o parsing do `content_list_v2.json`,
 a **tokenização** (só o tokenizer do BGE-M3 em CPU — nunca o modelo completo na GPU),
 o chunking estrutural (`StructuralTokenChunker`), os filtros de qualidade e a escrita
 de `chunks.jsonl`/`chunking_report.json` acontecem **antes** de adquirir o lock. O
-lock da GPU é adquirido **apenas** ao redor do embedding (dense+sparse); o build do
-payload e o upsert no Qdrant ocorrem depois, já com os vetores na CPU. Além disso, os
+embedding é uma chamada HTTP à API vLLM — não passa pelo lock; o build do
+payload e o upsert no Qdrant ocorrem depois, com os vetores já em memória. Além disso, os
 chunks antigos de um documento só são removidos **após** o upsert dos novos ser
 confirmado (uma falha no novo chunking não apaga os chunks ativos anteriores).
 

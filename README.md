@@ -74,7 +74,7 @@ uv run python scripts/compare_chunking_strategies.py \
     --strategies legacy_chars structural_tokens
 ```
 
-Avaliar recuperação (requer BGE-M3 + queries rotuladas):
+Avaliar recuperação (requer a API de embedding no ar + queries rotuladas):
 
 ```bash
 uv run python scripts/evaluate_chunking_retrieval.py \
@@ -151,15 +151,18 @@ Resposta `202` com a lista de jobs criados (um por PDF). Acompanhe cada um em
 - **MinIO** (docker-compose) acessível em `MINIO_ENDPOINT` — armazenamento oficial dos artefatos.
 - **MinerU API** acessível em `MINERU_API_URL` (usa GPU).
 - **Qdrant** acessível em `QDRANT_URL`.
-- Modelo **BAAI/bge-m3** no cache HuggingFace (senão é baixado no 1º job).
+- **API de embedding** (docker-compose): `vllm-bge-m3` (denso, `EMBED_API_URL`) e
+  `vllm-bge-m3-sparse` (esparso, `EMBED_API_SPARSE_URL`). O backend não carrega mais o
+  modelo — só o tokenizer do **BAAI/bge-m3** (cache HuggingFace), usado no chunking por
+  tokens e no alinhamento dos `lexical_weights`. Sem a API não há indexação nem busca.
 - `LLM_ENRICH_API_KEY` (ou o legado `DEEPSEEK_API_KEY`) para o enrich por LLM — **opcional e desacoplado**; sem ela o enrich é pulado e a indexação segue normalmente.
 - **Redis** (docker-compose): DB 0 = broker Celery, DB 1 = job_store (+ lock do
   manifesto), DB 2 = coordenação da GPU (`gpu_resource_manager`).
 
 ## Coordenação da GPU compartilhada
 
-A **mesma GPU física** é usada pelo subprocesso do MinerU (estágio 2) e pelo BGE-M3
-(estágio 3), além de eventuais scripts externos. Sem coordenação, execuções
+A **mesma GPU física** é usada pelo subprocesso do MinerU (estágio 2), pelos
+contêineres vLLM do bge-m3 (estágio 3) e por eventuais scripts externos. Sem coordenação, execuções
 simultâneas causam CUDA OOM, queda de workers e jobs inconsistentes. O
 `concurrency=1` da fila `gpu` do Celery só controla **aquele** worker — não o
 subprocesso do MinerU nem scripts externos.
@@ -172,11 +175,10 @@ Redis, ninguém usa a GPU).
 
 - **MinerU** adquire o recurso (prioridade `MINERU_GPU_PRIORITY=20`) só ao redor do
   subprocesso; download/DSpace/CSV ficam fora do lock.
-- **BGE-M3** adquire (prioridade `BGE_GPU_PRIORITY=30`) só ao redor da inferência;
-  chunking, filtros e upsert no Qdrant ficam fora do lock. O
-  [`BGEModelManager`](backend/services/bge_model_manager.py) descarrega a VRAM após
-  a task (`BGE_GPU_LIFECYCLE=lazy`, `BGE_UNLOAD_AFTER_TASK=true`) — o lock Redis não
-  libera VRAM sozinho.
+- **BGE-M3** ficou **fora** do lock: roda nos contêineres vLLM, cada um com um teto de
+  VRAM reservado no startup (`--gpu-memory-utilization`), então não há disputa a
+  arbitrar. O worker só faz HTTP (ver [`embedder.py`](backend/services/embedder.py)) —
+  chunking, filtros e upsert no Qdrant seguem locais.
 - **Scripts externos** usam a mesma lib/Redis/recurso (ver
   [exemplo](packages/gpu_resource_manager/examples/external_priority_script.py) e o
   README da biblioteca). CLI: `gpu-manager status|queue|health|cancel`.

@@ -146,6 +146,75 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # ------------------------------------------------------------------------
+  # Embedding (estágio 3): bge-m3 servido por vLLM. O backend NÃO carrega mais o
+  # modelo — só fala HTTP com estes dois serviços (ver backend/services/embedder.py).
+  #
+  # São DOIS porque o vLLM implementa o bge-m3 como `BgeM3EmbeddingModel`, cujo
+  # servidor HTTP fixa UMA pooling task por instância; a task combinada
+  # (embed&token_classify) só existe na API offline. Então: um contêiner para o
+  # denso (`embed`) e outro para o esparso (`token_classify`). O modelo é pequeno
+  # (~2,3 GB fp16), então as duas réplicas cabem folgadas e respondem em paralelo.
+  #
+  # `--hf-overrides` é obrigatório: sem ele o vLLM carrega o bge-m3 como XLM-R puro
+  # (só denso) e o `sparse_linear.pt` nunca é lido. O cache do HF é montado do host
+  # para não rebaixar o modelo a cada recriação.
+  vllm-bge-m3:
+    image: vllm/vllm-openai:v0.26.0
+    container_name: vllm-bge-m3
+    command:
+      - "--model=BAAI/bge-m3"
+      - "--hf-overrides={\"architectures\":[\"BgeM3EmbeddingModel\"]}"
+      - "--pooler-config={\"task\":\"embed\"}"
+      - "--gpu-memory-utilization=0.12"
+      - "--max-model-len=8192"
+    volumes:
+      - ${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+
+  vllm-bge-m3-sparse:
+    image: vllm/vllm-openai:v0.26.0
+    container_name: vllm-bge-m3-sparse
+    command:
+      - "--model=BAAI/bge-m3"
+      - "--hf-overrides={\"architectures\":[\"BgeM3EmbeddingModel\"]}"
+      - "--pooler-config={\"task\":\"token_classify\"}"
+      - "--gpu-memory-utilization=0.12"
+      - "--max-model-len=8192"
+    volumes:
+      - ${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+
 volumes:
   redis_data:
   minio_data:

@@ -1,7 +1,7 @@
 """Indexador batch de chunks semanticos no Qdrant.
 
 Escaneia output/ em busca de *_content_list_v2.json, gera chunks com MinerUChunker,
-calcula embeddings densos + esparsos (lexical_weights) via BAAI/bge-m3 (FlagEmbedding) e faz upsert na collection.
+calcula embeddings densos + esparsos (lexical_weights) via BAAI/bge-m3 (API vLLM) e faz upsert na collection.
 
 Uso:
     python -m backend.indexing.index_chunks
@@ -41,7 +41,7 @@ COLLECTION_NAME = QDRANT_COLLECTION  # alinhado com a busca (backend.core.config
 CONTENT_LIST_SUFFIX = "_content_list_v2.json"
 EMBEDDING_REPORT_PATH = Path("relatorio_embeddings.csv")
 
-# bge-m3: dense (1024d) + sparse (lexical_weights) — tudo via FlagEmbedding
+# bge-m3: dense (1024d) + sparse (lexical_weights) — tudo via API vLLM
 DENSE_MODEL = "BAAI/bge-m3"
 BATCH_SIZE = 32
 
@@ -62,13 +62,12 @@ log = logging.getLogger("mineru.indexer")
 # ---------------------------------------------------------------------------
 
 def check_models_available(embedder: BgeM3EmbedderService) -> None:
-    """Informa sobre o status local do modelo."""
-    print("\nVerificando disponibilidade dos modelos...")
-    if embedder.is_cached_locally():
-        print(f"  ✅   [Dense + Sparse] {DENSE_MODEL} já está no cache local.")
-    else:
-        print(f"  ℹ️   [Dense + Sparse] {DENSE_MODEL}  —  Download automático ativado via HuggingFace Hub.")
-    print("  Modelos prontos para uso.\n")
+    """Verifica se a API de embedding (vLLM) está no ar. Sem ela não há indexação."""
+    dense_url, sparse_url = embedder.endpoints()
+    print("\nVerificando a API de embedding (vLLM)...")
+    embedder.health_check(raise_on_error=True)
+    print(f"  ✅   [Dense]  {DENSE_MODEL} em {dense_url}")
+    print(f"  ✅   [Sparse] {DENSE_MODEL} em {sparse_url}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +315,8 @@ def index_document(
     total_chars = sum(len(t) for t in texts)
 
     # --- Embedding ---
-    # Só ESTE trecho toca a GPU: o embedder adquire o lock internamente (dense +
-    # sparse + transferência p/ CPU). Chunking (acima) e build de pontos + upsert
-    # no Qdrant (abaixo) ficam FORA do lock. document_id vai ao owner (diagnóstico).
+    # Chamada HTTP à API vLLM (dense + sparse); nada roda na GPU deste processo.
+    # document_id/task_id vão só para o log (diagnóstico).
     log.info("Gerando embeddings dense + sparse (bge-m3) para '%s' (%d textos, batch=%d)...", doc_id, len(texts), BATCH_SIZE)
     t_embed = time.perf_counter()
     dense_vecs, lexical_list = embedder.embed_documents(texts, batch_size=BATCH_SIZE, document_id=doc_id, task_id=task_id)
@@ -418,12 +416,12 @@ _api_ready = False
 
 
 def _get_indexer() -> tuple[QdrantClient, MinerUChunker, BgeM3EmbedderService]:
-    """Constrói (uma vez) os singletons de indexação. O embedder reusa o _SHARED_MODEL global."""
+    """Constrói (uma vez) os singletons de indexação. O embedder é um cliente HTTP
+    da API vLLM — a sonda de dimensão abaixo já falha cedo se a API estiver fora."""
     global _api_client, _api_chunker, _api_embedder, _api_ready
     if not _api_ready:
         _api_client = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS or None)
         _api_embedder = BgeM3EmbedderService()
-        _api_embedder.load_model(require_cache=False)  # reusa o modelo já carregado, se houver
         _api_chunker = MinerUChunker()
         setup_collection(_api_client, reset=False, dense_dim=_api_embedder.get_dense_dimension())
         _api_ready = True
@@ -515,8 +513,8 @@ def _index_structural_document(
 ) -> dict:
     """Caminho estrutural por tokens (§24).
 
-    Ordem: parse → chunk → persistência JSONL → embeddings (ÚNICO trecho sob o lock
-    da GPU) → build de pontos → upsert dos NOVOS → só então remove versões antigas
+    Ordem: parse → chunk → persistência JSONL → embeddings (chamada à API vLLM) →
+    build de pontos → upsert dos NOVOS → só então remove versões antigas
     (§27: uma falha antes do upsert não apaga os chunks ativos anteriores).
     """
     import uuid as _uuid
@@ -534,7 +532,7 @@ def _index_structural_document(
     ram_inicio = _ram_mb()
     t_total = time.perf_counter()
 
-    # --- Parse estrutural (CPU, FORA do lock da GPU) ---
+    # --- Parse estrutural (CPU, local) ---
     t_parse = time.perf_counter()
     parser = MinerUDocumentParser(
         remove_repeated_headers=settings.CHUNK_REMOVE_REPEATED_HEADERS,
@@ -560,7 +558,7 @@ def _index_structural_document(
     parse_time_s = time.perf_counter() - t_parse
     title = document_title or parser.document_title
 
-    # --- Chunking (CPU, FORA do lock da GPU) ---
+    # --- Chunking (CPU, local) ---
     t_chunk = time.perf_counter()
     chunker = get_chunker(strategy)
     result = chunker.chunk(
@@ -605,7 +603,7 @@ def _index_structural_document(
     texts = [c.embedding_input(field) for c in chunks]
     total_chars = sum(len(t) for t in texts)
 
-    # --- Embedding (ÚNICO trecho sob o lock da GPU) ---
+    # --- Embedding (API vLLM: dense + sparse) ---
     t_embed = time.perf_counter()
     dense_vecs, lexical_list = embedder.embed_documents(
         texts, batch_size=settings.EMBEDDING_BATCH_SIZE, document_id=doc_id, task_id=task_id
@@ -919,11 +917,12 @@ def main() -> None:
         sys.exit(1)
 
     embedder = BgeM3EmbedderService()
-    check_models_available(embedder)
-
-    print(f"\nCarregando modelo {DENSE_MODEL} (dense + sparse)...")
-    if not embedder.load_model(require_cache=False):
-        print("Falha ao carregar o modelo.")
+    try:
+        check_models_available(embedder)
+    except Exception as exc:
+        print(f"API de embedding indisponivel: {exc}")
+        print("Suba os conteineres: docker compose up -d vllm-bge-m3 vllm-bge-m3-sparse")
+        log.exception("Nao foi possivel falar com a API de embedding.")
         sys.exit(1)
 
     # Detecta a dimensao real do vetor denso para evitar mismatch na collection.

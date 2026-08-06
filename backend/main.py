@@ -24,21 +24,22 @@ async def lifespan(app: FastAPI):
     log.info("BASE_DIR: %s", BASE_DIR)
     log.info("OUTPUT_DIR: %s  (existe=%s)", OUTPUT_DIR, OUTPUT_DIR.exists())
 
-    # Pré-carrega o embedder bge-m3 (estágio 3) para a primeira requisição não pagar
-    # o custo do load. Guardado por try/except: sem GPU/cache o servidor sobe mesmo
-    # assim e o modelo é carregado sob demanda (require_cache=False no worker).
+    # Sonda a API de embedding (estágio 3) — o bge-m3 roda nos contêineres vLLM, não
+    # neste processo. O servidor sobe mesmo com a API fora: quem depende dela (busca
+    # e indexação) falha explicitamente na chamada, com a URL no erro.
     try:
         from backend.services.embedder import BgeM3EmbedderService
 
         embedder = BgeM3EmbedderService()
-        if embedder.is_cached_locally():
-            log.info("Pré-carregando modelo de embedding bge-m3…")
-            ok = embedder.load_model(require_cache=True)
-            log.info("bge-m3: %s", "carregado" if ok else "não carregado (fallback sob demanda)")
+        dense_url, sparse_url = embedder.endpoints()
+        if embedder.health_check():
+            log.info("API de embedding OK (dense=%s, sparse=%s)", dense_url, sparse_url)
         else:
-            log.warning("bge-m3 não está no cache local — será carregado sob demanda no 1º job.")
-    except Exception as exc:  # pragma: no cover - preload é best-effort
-        log.warning("Falha ao pré-carregar o embedder (seguindo sem preload): %s", exc)
+            log.warning("API de embedding indisponível (dense=%s, sparse=%s) — busca e "
+                        "indexação vão falhar até os contêineres vLLM subirem.",
+                        dense_url, sparse_url)
+    except Exception as exc:  # pragma: no cover - a sonda é best-effort
+        log.warning("Falha ao sondar a API de embedding (seguindo): %s", exc)
 
     log.info("=== Servidor pronto (porta %d) ===", APP_PORT)
     yield

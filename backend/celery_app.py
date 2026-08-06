@@ -79,52 +79,28 @@ app.conf.update(
 
 
 @worker_process_init.connect
-def _preload_embedder(**_):
-    """Preload do bge-m3 — SOMENTE no worker de GPU (WORKER_ROLE=gpu) e SOMENTE
-    quando explicitamente configurado.
+def _probe_embedder(**_):
+    """Sonda a API de embedding na subida do worker de GPU (WORKER_ROLE=gpu).
 
-    IMPORTANTE (GPU compartilhada com o MinerU): o `concurrency=1` da fila `gpu` só
-    controla as tasks DAQUELE worker Celery — NÃO controla o subprocesso do MinerU
-    nem scripts externos. Quem coordena TODOS os processos é o gpu_resource_manager
-    (lock distribuído no Redis DB 2). E o ciclo de vida do modelo na VRAM é
-    controlado pelo BGEModelManager (BGE_GPU_LIFECYCLE).
+    Não há mais preload de VRAM aqui: o bge-m3 roda nos contêineres vLLM, com VRAM
+    própria, e o worker só fala HTTP com eles. O que resta na fila `gpu` e sob o
+    lock do gpu_resource_manager é a extração do MinerU.
 
-    Por isso, com a GPU compartilhada (GPU_SHARED_WITH_MINERU=true, o padrão) NÃO
-    pré-carregamos o modelo direto na VRAM: se o bge-m3 ficasse residente, ocuparia
-    memória mesmo sem inferência e poderia causar OOM quando o MinerU rodasse. O
-    modelo é carregado sob demanda e movido para a GPU só sob o lock, sendo
-    descarregado após a task (BGE_GPU_LIFECYCLE=lazy + BGE_UNLOAD_AFTER_TASK=true).
-
-    O preload direto na VRAM só ocorre se BGE_GPU_LIFECYCLE=preload E a GPU não for
-    compartilhada (uso dedicado) — uma escolha explícita do operador."""
+    A sonda é informativa — falha na subida não derruba o worker; a task que
+    precisar de embedding falha com a URL no erro."""
     if os.getenv("WORKER_ROLE") != "gpu":
         return
 
-    from backend.core import config as settings
-
-    preload_to_vram = settings.BGE_GPU_LIFECYCLE == "preload" and not settings.GPU_SHARED_WITH_MINERU
-    if not preload_to_vram:
-        log.info(
-            "[worker gpu] Preload de VRAM desativado (lifecycle=%s, shared=%s) — "
-            "bge-m3 carregado sob demanda e movido à GPU sob o lock.",
-            settings.BGE_GPU_LIFECYCLE, settings.GPU_SHARED_WITH_MINERU,
-        )
-        return
-
     try:
-        from backend.services.bge_model_manager import get_model_manager
-
-        mm = get_model_manager()
         from backend.services.embedder import BgeM3EmbedderService
 
-        if BgeM3EmbedderService.is_cached_locally():
-            log.info("[worker gpu] Pré-carregando bge-m3 na VRAM (lifecycle=preload, GPU dedicada)…")
-            if mm.ensure_loaded():
-                mm.move_to_gpu()
-                log.info("[worker gpu] bge-m3 pré-carregado na VRAM.")
-            else:
-                log.warning("[worker gpu] bge-m3 não pôde ser carregado — fallback sob demanda.")
+        embedder = BgeM3EmbedderService()
+        dense_url, sparse_url = embedder.endpoints()
+        if embedder.health_check():
+            log.info("[worker gpu] API de embedding OK (dense=%s, sparse=%s)", dense_url, sparse_url)
         else:
-            log.warning("[worker gpu] bge-m3 não está no cache local — carga sob demanda no 1º job.")
+            log.warning("[worker gpu] API de embedding indisponível (dense=%s, sparse=%s) — "
+                        "a indexação vai falhar até os contêineres vLLM subirem.",
+                        dense_url, sparse_url)
     except Exception as exc:  # pragma: no cover
-        log.warning("[worker gpu] Falha ao pré-carregar o embedder: %s", exc)
+        log.warning("[worker gpu] Falha ao sondar a API de embedding: %s", exc)

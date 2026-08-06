@@ -19,10 +19,12 @@ dependencies = [
     "openai>=1.0.0",
     "python-dotenv>=1.2.2",
     "ruff>=0.15.10",
-    # Requeridos pelos serviços copiados verbatim do minerU (estágio 3):
-    #   - flagembedding: embedder.py usa FlagEmbedding.BGEM3FlagModel (dense+sparse)
-    #   - markdownify:  chunks.py converte tabelas HTML → Markdown
-    "flagembedding>=1.3.5",
+    # Embedding (estágio 3): o bge-m3 roda nos contêineres vLLM; aqui só precisamos
+    # do cliente HTTP (httpx) e do tokenizer (transformers) — o tokenizer alinha os
+    # lexical_weights token a token e também alimenta o chunking por tokens.
+    "httpx>=0.27",
+    "transformers>=4.40",
+    # markdownify: chunks.py converte tabelas HTML → Markdown
     "markdownify>=0.14.1",
     "celery[redis]>=5.4",
     "flower>=2.0.1",

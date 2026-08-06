@@ -21,6 +21,25 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "evidencia_chunks")
 DENSE_MODEL = "BAAI/bge-m3"
 CACHE_DIR = "/root/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181/"
 
+# --------------------------------------------------------------------------
+# API de embedding (vLLM servindo o bge-m3) — ver backend/services/embedder.py.
+# O modelo NÃO roda mais no processo do backend; são dois contêineres vLLM, um
+# por pooling task, porque o servidor HTTP fixa uma task por instância e a task
+# combinada (embed&token_classify) só existe na API offline do vLLM.
+#   EMBED_API_URL        → task `embed`          (denso, via /v1/embeddings)
+#   EMBED_API_SPARSE_URL → task `token_classify` (esparso, via /pooling)
+# Não há fallback local: sem API, o embedding falha explicitamente.
+# --------------------------------------------------------------------------
+EMBED_API_URL = os.getenv("EMBED_API_URL", "http://127.0.0.1:8000").rstrip("/")
+EMBED_API_SPARSE_URL = os.getenv("EMBED_API_SPARSE_URL", "http://127.0.0.1:8001").rstrip("/")
+EMBED_API_MODEL = os.getenv("EMBED_API_MODEL", DENSE_MODEL).strip()
+EMBED_API_TIMEOUT_SECONDS = float(os.getenv("EMBED_API_TIMEOUT_SECONDS", "120"))
+EMBED_API_MAX_RETRIES = int(os.getenv("EMBED_API_MAX_RETRIES", "2"))
+# Teto de tokens por entrada. Deve ser <= --max-model-len dos contêineres; o
+# truncamento é feito aqui (não no servidor) para o alinhamento peso↔token do
+# esparso continuar exato.
+EMBED_API_MAX_TOKENS = int(os.getenv("EMBED_API_MAX_TOKENS", "8192"))
+
 # API do MinerU rodando via Docker (container mineru-api, profile "api") — estágio 2.
 MINERU_API_URL = os.getenv("MINERU_API_URL", "http://127.0.0.1:8010")
 # Backend/método/idioma do MinerU (flags -b/-m/-l). Configuráveis para permitir
@@ -57,40 +76,15 @@ GPU_MANAGER_REDIS_URL = os.getenv("GPU_MANAGER_REDIS_URL", f"{REDIS_URL}/2")
 GPU_RESOURCE_NAME = os.getenv("GPU_RESOURCE_NAME", "gpu0")
 
 # Prioridades dos consumidores internos (menor número = maior prioridade; a fila é
-# ordenada ascendente por effective_priority). A biblioteca NÃO conhece
-# "mineru"/"bge-m3"; os nomes/prioridades vivem aqui.
+# ordenada ascendente por effective_priority). A biblioteca NÃO conhece "mineru";
+# os nomes/prioridades vivem aqui.
 #
-# Esquema (do mais prioritário ao menos): externo/interativo (10) < índice bge-m3 (15)
-# < extração MinerU (20). O ÍNDICE (bge-m3) é MAIS prioritário que a EXTRAÇÃO de
-# propósito: sob lote grande, o MinerU (longo) gera um backlog que, se tivesse
-# prioridade maior, faria o índice (rápido) ser "starved" — foi o que ocorreu no teste
-# de 64 (3 jobs estouraram o wait_timeout de 1800s esperando a GPU). Dando ao índice
-# prioridade acima da extração, cada doc extraído é indexado logo (drena o pipeline);
-# não há preempção, então a extração em andamento nunca é interrompida — só a ORDEM da
-# fila de espera muda. Aging (−1 a cada 5 min) sozinho não resolvia: em 30 min o bge-m3
-# só cairia de 30→24, sem alcançar o 20 do MinerU.
+# Esquema: externo/interativo (10) < extração MinerU (20). O bge-m3 saiu do lock —
+# ele roda nos contêineres vLLM, com VRAM própria e reservada (ver EMBED_API_*), e
+# não disputa mais o gpu0 com a extração. Consequência prática: o índice nunca é
+# "starved" pelo backlog de extrações, que era o motivo de ele ter prioridade
+# acima do MinerU na arbitragem antiga.
 MINERU_GPU_PRIORITY = int(os.getenv("MINERU_GPU_PRIORITY", "20"))
-BGE_GPU_PRIORITY = int(os.getenv("BGE_GPU_PRIORITY", "15"))
-
-# Ciclo de vida do BGE-M3 na VRAM (ver backend/services/bge_model_manager.py).
-#   preload | lazy | cpu_idle | unload   — padrão p/ GPU compartilhada: lazy.
-BGE_GPU_LIFECYCLE = os.getenv("BGE_GPU_LIFECYCLE", "lazy").strip().lower()
-BGE_UNLOAD_AFTER_TASK = os.getenv("BGE_UNLOAD_AFTER_TASK", "true").strip().lower() in {"1", "true", "yes", "on"}
-GPU_SHARED_WITH_MINERU = os.getenv("GPU_SHARED_WITH_MINERU", "true").strip().lower() in {"1", "true", "yes", "on"}
-
-# Device do embedding bge-m3:
-#   auto (padrão) — tenta a GPU com timeout curto; se o lock não vier a tempo (MinerU
-#                   ocupando o gpu0), cai para CPU (fp32, sem lock) e NÃO trava o índice.
-#   gpu           — sempre GPU (espera o wait_timeout cheio; comportamento estrito).
-#   cpu           — sempre CPU (nunca toca a GPU).
-# A CPU roda em paralelo ao MinerU e elimina a contenção do índice; o embedding é barato,
-# então a lentidão da CPU é aceitável (roda concorrente, não bloqueia). fp32 em CPU;
-# embeddings CPU(fp32) e GPU(fp16) são intercambiáveis na mesma collection (Δ ~1e-3).
-EMBED_DEVICE = os.getenv("EMBED_DEVICE", "auto").strip().lower()
-if EMBED_DEVICE not in {"auto", "gpu", "cpu"}:
-    EMBED_DEVICE = "auto"
-# No modo auto: segundos a esperar pelo lock da GPU antes de cair para CPU.
-EMBED_GPU_ACQUIRE_TIMEOUT = int(os.getenv("EMBED_GPU_ACQUIRE_TIMEOUT", "45"))
 
 # Enriquecimento de metadados por LLM (llm_enrich_service) — DESACOPLADO do
 # provedor e da indexação. Qualquer endpoint OpenAI-compatible serve; o provedor
