@@ -1,116 +1,176 @@
 """Testes de integração de coordenação de GPU no evidencia_pipe (§40, subconjunto
 testável sem GPU/torch reais). Cobrem:
 
-  - MinerU adquire a GPU e mantém o lock durante o subprocesso (mock);
-  - MinerU libera o lock após falha do subprocesso (encerrando o grupo de processos);
+  - MinerU adquire a GPU e mantém o lock enquanto o contêiner processa (mock HTTP);
+  - MinerU libera o lock quando a chamada HTTP falha;
+  - MinerU libera o lock e levanta RuntimeError no timeout;
   - prioridade: script externo (10) roda antes de um consumidor comum (15); nenhum
     interrompe o MinerU;
   - falha do Redis impede a execução CUDA (fail-closed).
 
-O bge-m3 não aparece mais aqui: ele roda nos contêineres vLLM (VRAM própria) e não
-disputa o lock do gpu0. Os intervalos de uso da GPU nunca se sobrepõem.
+O MinerU não roda mais em subprocesso local: `mineru_service` fala HTTP com o
+contêiner `mineru-api`. O lock continua existindo porque a GPU é a mesma — o que
+mudou é quem a usa (o servidor), não a necessidade de serializar.
+
+O bge-m3 não aparece aqui: roda nos contêineres vLLM (VRAM própria) e não disputa o
+lock do gpu0. Os intervalos de uso da GPU nunca se sobrepõem.
 """
 
+import io
 import threading
 import time
+import zipfile
 from unittest import mock
 
+import httpx
 import pytest
 
 from gpu_resource_manager import GPUBackendUnavailable, GPUResourceManager, GPUManagerConfig
 
 
 # --------------------------------------------------------------------------- #
+# Dublê do cliente HTTP do mineru-api
+# --------------------------------------------------------------------------- #
+def _zip_bytes(stem: str) -> bytes:
+    """ZIP no mesmo layout que o servidor devolve: <stem>/auto/<stem>_*.json|md."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"{stem}/auto/{stem}_content_list_v2.json", "[[]]")
+        zf.writestr(f"{stem}/auto/{stem}.md", "# doc\n")
+    return buf.getvalue()
+
+
+class _Resp:
+    def __init__(self, payload=None, content=b""):
+        self._payload = payload
+        self.content = content
+        self.text = ""
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def _dummy_pdf(path):
+    """PDF mínimo: `_submit` abre o arquivo de verdade (o subprocesso antigo não abria)."""
+    path.write_bytes(b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n")
+    return path
+
+
+class _FakeClient:
+    """Cliente mínimo compatível com o uso que `mineru_service` faz do httpx."""
+
+    def __init__(self, *, stem="doc", status="completed", on_post=None, on_get=None):
+        self.stem = stem
+        self.status = status
+        self.on_post = on_post
+        self.on_get = on_get
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, data=None, files=None):
+        if self.on_post:
+            self.on_post()
+        return _Resp(payload={"task_id": "task-1"})
+
+    def get(self, url):
+        if self.on_get:
+            self.on_get()
+        if url.endswith("/result"):
+            return _Resp(content=_zip_bytes(self.stem))
+        return _Resp(payload={"status": self.status})
+
+
+# --------------------------------------------------------------------------- #
 # MinerU
 # --------------------------------------------------------------------------- #
-def test_mineru_holds_lock_during_subprocess_and_releases(gpu_manager_fake, tmp_path):
+def test_mineru_holds_lock_during_http_call_and_releases(gpu_manager_fake, tmp_path):
     import backend.services.mineru_service as ms
 
     manager = gpu_manager_fake
     observed = {}
 
-    class FakeProc:
-        pid = 4321
-        returncode = 0
+    def during_post():
+        # enquanto o contêiner "processa", o lock deve estar retido por mineru
+        st = manager.get_status(resource="gpu0")
+        observed["locked_during"] = st.locked
+        observed["owner_service"] = st.owner["service"] if st.owner else None
+        observed["owner_document"] = st.owner.get("document_id") if st.owner else None
 
-        def communicate(self, timeout=None):
-            # enquanto o "subprocesso" roda, o lock deve estar retido por mineru
-            st = manager.get_status(resource="gpu0")
-            observed["locked_during"] = st.locked
-            observed["owner_service"] = st.owner["service"] if st.owner else None
-            observed["owner_document"] = st.owner.get("document_id") if st.owner else None
-            return ("stdout", "stderr")
-
-        def poll(self):
-            return 0
-
-    with mock.patch.object(ms.subprocess, "Popen", return_value=FakeProc()):
-        result = ms.process_pdf(tmp_path / "doc123.pdf", tmp_path, task_id="celery-1", document_id="doc123")
+    pdf = _dummy_pdf(tmp_path / "doc123.pdf")
+    fake = _FakeClient(stem="doc123", on_post=during_post)
+    with mock.patch.object(ms, "_client", return_value=fake):
+        result = ms.process_pdf(pdf, tmp_path,
+                                task_id="celery-1", document_id="doc123")
 
     assert observed["locked_during"] is True
     assert observed["owner_service"] == "mineru"
     assert observed["owner_document"] == "doc123"
     assert result["status"] == "Sucesso"
+    # o ZIP do servidor foi materializado no layout que o stage_mineru espera
+    assert (tmp_path / "doc123" / "auto" / "doc123_content_list_v2.json").is_file()
     # lock liberado ao final
     assert manager.get_status(resource="gpu0").locked is False
 
 
-def test_mineru_releases_lock_after_subprocess_failure(gpu_manager_fake, tmp_path):
+def test_mineru_releases_lock_after_http_failure(gpu_manager_fake, tmp_path):
+    """Erro de transporte propaga (como o subprocesso fazia) e solta o lock."""
     import backend.services.mineru_service as ms
 
     manager = gpu_manager_fake
-    killed = {}
 
-    class ExplodingProc:
-        pid = 9999
-        returncode = None
+    def boom():
+        raise httpx.ConnectError("mineru-api fora do ar")
 
-        def communicate(self, timeout=None):
-            raise TimeoutError("subprocesso travou")
+    pdf = _dummy_pdf(tmp_path / "docX.pdf")
+    fake = _FakeClient(on_post=boom)
+    with mock.patch.object(ms, "_client", return_value=fake):
+        with pytest.raises(httpx.HTTPError):
+            ms.process_pdf(pdf, tmp_path, document_id="docX")
 
-        def poll(self):
-            return None
-
-    def fake_kill_group(proc, grace_seconds=10.0):
-        killed["group"] = proc.pid
-
-    with mock.patch.object(ms.subprocess, "Popen", return_value=ExplodingProc()), \
-         mock.patch.object(ms, "_terminate_process_group", side_effect=fake_kill_group):
-        with pytest.raises(TimeoutError):
-            ms.process_pdf(tmp_path / "docX.pdf", tmp_path, document_id="docX")
-
-    # grupo de processos encerrado e lock liberado mesmo na falha
-    assert killed.get("group") == 9999
     assert manager.get_status(resource="gpu0").locked is False
 
 
-def test_mineru_timeout_kills_group_and_raises(gpu_manager_fake, tmp_path, monkeypatch):
-    """MINERU_TIMEOUT_SECONDS estourado → subprocess.TimeoutExpired → grupo encerrado
-    (libera a VRAM), lock liberado e RuntimeError propagado."""
+def test_mineru_task_failure_returns_error_status(gpu_manager_fake, tmp_path):
+    """Falha do parse no servidor ≈ returncode != 0: NÃO levanta, vira status Erro
+    (quem aborta o pipeline é o stage_mineru)."""
+    import backend.services.mineru_service as ms
+
+    manager = gpu_manager_fake
+    pdf = _dummy_pdf(tmp_path / "docY.pdf")
+    fake = _FakeClient(status="failed")
+    with mock.patch.object(ms, "_client", return_value=fake):
+        result = ms.process_pdf(pdf, tmp_path, document_id="docY")
+
+    assert result["status"] == "Erro"
+    assert manager.get_status(resource="gpu0").locked is False
+
+
+def test_mineru_timeout_releases_lock_and_raises(gpu_manager_fake, tmp_path, monkeypatch):
+    """MINERU_TIMEOUT_SECONDS estourado → RuntimeError e lock liberado.
+
+    Diferente do subprocesso: a API 3.4.x não permite cancelar, então a tarefa segue
+    rodando no servidor — só paramos de aguardar."""
     import backend.services.mineru_service as ms
     from backend.core import config as settings
 
     monkeypatch.setattr(settings, "MINERU_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(ms, "_POLL_INTERVAL_SECONDS", 0.01)
     manager = gpu_manager_fake
-    killed = {}
 
-    class HangingProc:
-        pid = 7777
-        returncode = None
-
-        def communicate(self, timeout=None):
-            raise ms.subprocess.TimeoutExpired(cmd="mineru", timeout=timeout)
-
-        def poll(self):
-            return None
-
-    with mock.patch.object(ms.subprocess, "Popen", return_value=HangingProc()), \
-         mock.patch.object(ms, "_terminate_process_group",
-                           side_effect=lambda proc, grace_seconds=10.0: killed.update(group=proc.pid)):
+    # nunca sai de "pending" → o deadline é quem encerra
+    pdf = _dummy_pdf(tmp_path / "slow.pdf")
+    fake = _FakeClient(status="pending")
+    with mock.patch.object(ms, "_client", return_value=fake):
         with pytest.raises(RuntimeError, match="timeout"):
-            ms.process_pdf(tmp_path / "slow.pdf", tmp_path, document_id="slow")
+            ms.process_pdf(pdf, tmp_path, document_id="slow")
 
-    assert killed.get("group") == 7777
     assert manager.get_status(resource="gpu0").locked is False
 
 

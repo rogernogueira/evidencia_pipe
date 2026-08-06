@@ -1,25 +1,55 @@
-import os
-import signal
-import time
+"""Estágio 2 — extração via MinerU, falando HTTP direto com o contêiner.
+
+O MinerU roda EXCLUSIVAMENTE no serviço Docker (`mineru-api`, ver docker-compose).
+Este módulo é cliente da API dele: submete o PDF, aguarda a tarefa e extrai o ZIP de
+resultado no `output_dir`.
+
+Antes este módulo chamava `uv run mineru --api-url …` num subprocesso. A CLI era só
+um cliente HTTP do MESMO contêiner — mas obrigava o host a instalar `mineru[all]`
+(~3 GB de torch/vllm para, na prática, fazer requisições) e criava um acoplamento de
+versão cliente↔servidor que já quebrou em produção (contêiner legado em 3.2.0 contra
+cliente 3.4.4). Falar HTTP direto elimina os dois problemas.
+
+Equivalência verificada (3.4.4, backend pipeline, mesmo servidor): o
+`content_list_v2.json` que vem no ZIP do servidor é IDÊNTICO ao que a CLI gerava
+localmente, inclusive no layout de diretórios `<stem>/auto/`. O contrato com
+`stage_mineru` (que faz rglob por `*_content_list_v2.json`, `*.md` e `images/`)
+permanece intacto.
+
+Atenção ao formato: `return_content_list=true` sozinho devolve o content_list **v1**
+(plano). O v2 — o que `document_blocks.py` parseia — só vem com
+`response_format_zip=true`, dentro do ZIP.
+"""
+
+import io
 import subprocess
 import threading
+import time
+import zipfile
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-import psutil
+
+import httpx
 from pypdf import PdfReader
 
 from backend.core import config as settings
 from backend.core.config import MINERU_API_URL
 from backend.core.logger import log
 
+# Intervalo de polling da tarefa no servidor.
+_POLL_INTERVAL_SECONDS = 3.0
+# Estados terminais da API de tarefas do MinerU 3.4.x.
+_DONE_STATES = frozenset({"completed", "failed", "error"})
+_FAILED_STATES = frozenset({"failed", "error"})
+
 
 @contextmanager
 def _mineru_gpu_lease(pdf_path: Path, task_id, document_id):
-    """Adquire o recurso de GPU imediatamente antes do subprocesso do MinerU usar
-    CUDA e o mantém enquanto o subprocesso (e seus filhos) roda. Fica FORA deste
-    lock: download, resolução DSpace, criação de diretórios, contagem de páginas,
-    validações posteriores e escrita de CSV. Import tardio para não acoplar o
-    módulo à lib quando GPU_MANAGER_ENABLED=false."""
+    """Adquire o recurso de GPU enquanto o contêiner processa o PDF. Quem usa CUDA é
+    o servidor, mas a GPU é a MESMA — o lock continua serializando o acesso contra o
+    bge-m3. Ficam FORA do lock: download, criação de diretórios, contagem de páginas
+    e a extração do ZIP. Import tardio para não acoplar o módulo à lib quando
+    GPU_MANAGER_ENABLED=false."""
     from backend.services.gpu_manager import get_gpu_manager
 
     manager = get_gpu_manager()
@@ -34,37 +64,9 @@ def _mineru_gpu_lease(pdf_path: Path, task_id, document_id):
         yield lease
 
 
-def _terminate_process_group(process: subprocess.Popen, grace_seconds: float = 10.0) -> None:
-    """Encerra o subprocesso do MinerU E seus filhos (que seguram a VRAM). Usa o
-    grupo de processos criado por start_new_session=True: SIGTERM, aguarda, e por
-    fim SIGKILL. Só então o lock deve ser liberado (senão a VRAM continuaria presa)."""
-    if process.poll() is not None:
-        return
-    try:
-        pgid = os.getpgid(process.pid)
-    except ProcessLookupError:  # pragma: no cover
-        return
-    log.warning("MinerU: encerrando grupo de processos pgid=%s (SIGTERM)...", pgid)
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:  # pragma: no cover
-        return
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        log.warning("MinerU: grupo pgid=%s não terminou; enviando SIGKILL.", pgid)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:  # pragma: no cover
-        pass
-    try:
-        process.wait(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:  # pragma: no cover
-        log.error("MinerU: grupo pgid=%s ainda ativo após SIGKILL.", pgid)
-
 def get_vram_usage():
-    """Retorna o uso atual de VRAM da GPU (em MB) usando nvidia-smi"""
+    """Uso atual de VRAM da GPU (MB) via nvidia-smi. Continua medindo a GPU INTEIRA
+    (como antes) — o processo que consome agora é o do contêiner, não um filho nosso."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
@@ -75,37 +77,17 @@ def get_vram_usage():
     except Exception:
         return 0
 
-def monitor_resources(pid, stats, stop_event):
-    """Monitora o pico de uso de RAM e VRAM em uma thread separada"""
-    max_ram_mb = 0
+
+def monitor_vram(stats, stop_event):
+    """Amostra o pico de VRAM enquanto o contêiner processa."""
     max_vram_mb = 0
-
-    try:
-        proc = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        proc = None
-
     while not stop_event.is_set():
-        ram_mb = 0
-        if proc and proc.is_running():
-            try:
-                ram_mb = proc.memory_info().rss / (1024 * 1024)
-                for child in proc.children(recursive=True):
-                    ram_mb += child.memory_info().rss / (1024 * 1024)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        
-        if ram_mb > max_ram_mb:
-            max_ram_mb = ram_mb
-        
         vram_mb = get_vram_usage()
         if vram_mb > max_vram_mb:
             max_vram_mb = vram_mb
-            
         time.sleep(1)
-        
-    stats['max_ram_mb'] = max_ram_mb
     stats['max_vram_mb'] = max_vram_mb
+
 
 def count_pages(pdf_path):
     """Conta as páginas do PDF usando pypdf"""
@@ -115,80 +97,151 @@ def count_pages(pdf_path):
     except Exception:
         return 0
 
-def process_pdf(pdf_path: Path, output_dir: Path, *, task_id=None, document_id=None) -> dict:
-    """Processa o PDF usando o mineru e coleta métricas.
 
-    O subprocesso do MinerU roda sob o lock da GPU (gpu_resource_manager). O lock é
-    adquirido imediatamente antes do subprocesso e mantido enquanto ele (e seus
-    filhos) usam CUDA. Em falha/timeout, o grupo de processos é encerrado ANTES de
-    liberar o lock (a VRAM não é liberada só por soltar o lock). Contagem de páginas,
-    criação de diretório e leitura de métricas de saída ficam fora do lock."""
+def _client() -> httpx.Client:
+    """Cliente HTTP para o mineru-api. O timeout de leitura é generoso porque o
+    servidor responde só ao fim do parse quando o resultado é grande."""
+    return httpx.Client(
+        base_url=MINERU_API_URL.rstrip("/"),
+        timeout=httpx.Timeout(300.0, connect=10.0),
+    )
+
+
+def _submit(client: httpx.Client, pdf_path: Path) -> str:
+    """Submete o PDF e devolve o task_id.
+
+    `response_format_zip=true` é OBRIGATÓRIO: é a única forma de o servidor devolver
+    o `content_list_v2.json` (sem ele vem o content_list v1, que o parser descarta)."""
+    # dict (não lista de tuplas): o httpx só monta o multipart corretamente assim.
+    # `lang_list` é array na API — vai como lista, que o httpx repete no corpo.
+    data = {
+        "backend": settings.MINERU_BACKEND,
+        "parse_method": settings.MINERU_METHOD,
+        "lang_list": [settings.MINERU_LANG],
+        "return_md": "true",
+        "return_content_list": "true",
+        "return_images": "true",
+        "response_format_zip": "true",
+    }
+    with pdf_path.open("rb") as fh:
+        resp = client.post(
+            "/tasks", data=data,
+            files=[("files", (pdf_path.name, fh, "application/pdf"))],
+        )
+    resp.raise_for_status()
+    task_id = resp.json().get("task_id")
+    if not task_id:
+        raise RuntimeError(f"mineru-api não devolveu task_id: {resp.text[:200]}")
+    return task_id
+
+
+def _wait(client: httpx.Client, task_id: str, deadline: float | None, pdf_name: str) -> str:
+    """Aguarda a tarefa e devolve o estado final.
+
+    Mantém a semântica antiga de `process_pdf`: falha do parse NÃO levanta (vira
+    status "Erro", e quem decide é o `stage_mineru`); timeout levanta RuntimeError,
+    como o subprocesso fazia.
+
+    A API 3.4.x NÃO expõe cancelamento — em timeout apenas paramos de aguardar; o
+    servidor segue processando até concluir sozinho. Difere do comportamento antigo,
+    em que matávamos o grupo de processos local e liberávamos a VRAM na hora."""
+    while True:
+        resp = client.get(f"/tasks/{task_id}")
+        resp.raise_for_status()
+        body = resp.json()
+        state = str(body.get("status", "")).lower()
+        if state in _FAILED_STATES:
+            log.error("MinerU: tarefa %s falhou para %s: %s",
+                      task_id, pdf_name, body.get("error") or body)
+            return state
+        if state in _DONE_STATES:
+            return state
+        if deadline is not None and time.time() > deadline:
+            log.error(
+                "MinerU: timeout aguardando a tarefa %s de %s. O servidor CONTINUA "
+                "processando (a API não permite cancelar).", task_id, pdf_name,
+            )
+            raise RuntimeError(
+                f"MinerU excedeu o timeout de {settings.MINERU_TIMEOUT_SECONDS}s para {pdf_name}"
+            )
+        time.sleep(_POLL_INTERVAL_SECONDS)
+
+
+def _extract_zip(raw: bytes, output_dir: Path) -> None:
+    """Extrai o ZIP no output_dir, reproduzindo o layout `<stem>/auto/…` que a CLI
+    criava. Rejeita caminhos que escapem do destino (zip slip)."""
+    if raw[:2] != b"PK":
+        raise RuntimeError(
+            f"mineru-api devolveu {len(raw)} byte(s) que não são um ZIP "
+            f"(início: {raw[:60]!r}). Confira response_format_zip."
+        )
+    output_dir = output_dir.resolve()
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            dest = (output_dir / member.filename).resolve()
+            if not dest.is_relative_to(output_dir):
+                raise RuntimeError(f"entrada suspeita no ZIP do MinerU: {member.filename!r}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, dest.open("wb") as out:
+                out.write(src.read())
+
+
+def process_pdf(pdf_path: Path, output_dir: Path, *, task_id=None, document_id=None) -> dict:
+    """Extrai o PDF no contêiner MinerU e materializa a saída em `output_dir`.
+
+    O lock de GPU (gpu_resource_manager) cobre submissão + espera, porque é nesse
+    intervalo que o contêiner usa CUDA. Ficam fora do lock: contagem de páginas,
+    extração do ZIP e a contagem de imagens/tabelas."""
     pages = count_pages(pdf_path)          # fora do lock (só lê o PDF)
     basename = pdf_path.stem
 
     file_output_dir = output_dir / basename
     file_output_dir.mkdir(parents=True, exist_ok=True)  # fora do lock
 
-    # Backend/método/idioma vêm da config (env) — permitem A/B de desempenho x
-    # qualidade sem alterar código. Defaults preservam o comportamento anterior
-    # (-m auto -l latin -b hybrid-auto-engine).
-    cmd = [
-        "/root/.local/bin/uv", "run", "mineru",
-        "-p", str(pdf_path),
-        "-o", str(output_dir),
-        "--api-url", MINERU_API_URL,
-        "-m", settings.MINERU_METHOD,
-        "-l", settings.MINERU_LANG,
-        "-b", settings.MINERU_BACKEND,
-    ]
-    log.info("MinerU cmd: -m %s -l %s -b %s (api=%s)",
+    log.info("MinerU: -m %s -l %s -b %s (api=%s)",
              settings.MINERU_METHOD, settings.MINERU_LANG, settings.MINERU_BACKEND, MINERU_API_URL)
-
-    stats = {'max_ram_mb': 0, 'max_vram_mb': 0}
-    stop_event = threading.Event()
-
     log.info("Iniciando MinerU: %s (%d páginas)", pdf_path.name, pages)
+
+    stats = {'max_vram_mb': 0}
+    stop_event = threading.Event()
     start_time = time.time()
+    timeout_s = settings.MINERU_TIMEOUT_SECONDS or None
+    deadline = (start_time + timeout_s) if timeout_s else None
 
     lease_cm = (
         _mineru_gpu_lease(pdf_path, task_id, document_id)
         if settings.GPU_MANAGER_ENABLED else nullcontext()
     )
+    status = "Sucesso"
+    raw = b""
     with lease_cm:
-        # start_new_session=True → novo grupo de processos, para poder matar o
-        # MinerU e TODOS os seus filhos (que seguram a VRAM) de uma vez.
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            start_new_session=True,
-        )
-        monitor_thread = threading.Thread(target=monitor_resources, args=(process.pid, stats, stop_event))
+        monitor_thread = threading.Thread(target=monitor_vram, args=(stats, stop_event))
         monitor_thread.start()
-        mineru_timeout = settings.MINERU_TIMEOUT_SECONDS or None
+        # Timeout e erro de transporte PROPAGAM (o subprocesso também propagava);
+        # o `with lease_cm` garante a liberação do lock. Só a falha do parte-servidor
+        # vira status "Erro", como o returncode != 0 fazia antes.
         try:
-            stdout, stderr = process.communicate(timeout=mineru_timeout)
-        except subprocess.TimeoutExpired:
-            # Wall-clock estourado: encerra o grupo (libera a VRAM) e falha limpo.
-            log.error("MinerU: timeout de %ss excedido para %s — encerrando subprocesso.",
-                      mineru_timeout, pdf_path.name)
-            _terminate_process_group(process)
+            with _client() as client:
+                server_task = _submit(client, pdf_path)
+                log.info("MinerU: tarefa %s submetida para %s", server_task, pdf_path.name)
+                if _wait(client, server_task, deadline, pdf_path.name) in _FAILED_STATES:
+                    status = "Erro"
+                else:
+                    result = client.get(f"/tasks/{server_task}/result")
+                    result.raise_for_status()
+                    raw = result.content
+        finally:
             stop_event.set()
             monitor_thread.join()
-            raise RuntimeError(f"MinerU excedeu o timeout de {mineru_timeout}s para {pdf_path.name}")
-        except BaseException:
-            # Erro/cancelamento (inclui SoftTimeLimitExceeded do Celery): encerra o
-            # grupo e AGUARDA antes de liberar o lock (preserva o lease do `with`).
-            log.error("MinerU: exceção durante a execução de %s — encerrando subprocesso.", pdf_path.name)
-            _terminate_process_group(process)
-            stop_event.set()
-            monitor_thread.join()
-            raise
         processing_time = time.time() - start_time
-        stop_event.set()
-        monitor_thread.join()
-    # A partir daqui o lock já foi liberado; o resto (leitura de arquivos de saída,
-    # contagem de imagens/tabelas, montagem das métricas) não usa a GPU.
+    # A partir daqui o lock já foi liberado; nada abaixo usa a GPU.
 
-    # Contagens de Extrações (a saída do MinerU fica em <basename>/<método>/, ex: hybrid_auto/)
+    if status == "Sucesso":
+        _extract_zip(raw, output_dir)
+
+    # Contagens de extrações (a saída fica em <basename>/<método>/, ex: auto/)
     images_count = 0
     tables_count = 0
 
@@ -209,19 +262,16 @@ def process_pdf(pdf_path: Path, output_dir: Path, *, task_id=None, document_id=N
         except Exception:
             pass
 
-    status = "Sucesso" if process.returncode == 0 else "Erro"
-    if status == "Erro":
-        log.error("Erro ao processar %s. Logs: %s...", pdf_path.name, stderr[:200])
-
-    metrics = {
+    return {
         "arquivo": pdf_path.name,
         "tempo_processamento_s": round(processing_time, 2),
         "quantidade_paginas": pages,
         "quantidade_imagens_extraidas": images_count,
         "quantidade_tabelas_extraidas": tables_count,
-        "ram_max_mb": round(stats['max_ram_mb'], 2),
+        # A extração roda no contêiner: o host não tem mais um subprocesso cuja RSS
+        # medir. A chave é mantida para não quebrar o CSV/relatório e o schema do
+        # processing_metrics.json. Para RAM do extrator, olhe `docker stats`.
+        "ram_max_mb": 0.0,
         "vram_max_mb": round(stats['max_vram_mb'], 2),
-        "status": status
+        "status": status,
     }
-    
-    return metrics
