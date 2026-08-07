@@ -210,10 +210,93 @@ vazio, veja *Problemas conhecidos*.
 
 ## 7. API e workers (systemd)
 
+### 7.1 Escolha o usuário e o caminho antes de instalar
+
+Os units versionados assumem a máquina de referência: **root**, `uv` em
+`/root/.local/bin/uv` e repositório em `/app/evidencia_pipe`. Se o seu host diverge —
+por exemplo, `uv` instalado em `/home/<user>/.local/bin` —, escolha uma das duas
+opções abaixo **antes** de rodar o `install.sh`.
+
+#### Opção A — instalar como root (nada a ajustar)
+
+```bash
+sudo -i
+curl -LsSf https://astral.sh/uv/install.sh | sh    # uv em /root/.local/bin
+source $HOME/.local/bin/env
+git clone git@github.com:rogernogueira/evidencia_pipe.git /app/evidencia_pipe
+cd /app/evidencia_pipe && uv sync
+cd deploy/systemd && ./install.sh
+```
+
+#### Opção B — rodar como usuário comum
+
+Instale os units normalmente e sobrescreva por **drop-in**, sem tocar nos arquivos
+versionados. Ajuste por unit:
+
+| Unit | O que sobrescrever |
+|---|---|
+| `evidencia-compose` | só o `WorkingDirectory` (deixe rodando como root — assim não precisa do grupo `docker`) |
+| `evidencia-api`, `evidencia-worker-light`, `evidencia-worker-gpu` | `User`, `WorkingDirectory`, `PATH` e o `ExecStart` |
+
+```bash
+sudo systemctl edit evidencia-compose
+```
+
+```ini
+[Service]
+WorkingDirectory=/home/rogeriosousa/evidencia_pipe
+```
+
+```bash
+sudo systemctl edit evidencia-api      # repita para worker-light e worker-gpu
+```
+
+```ini
+[Service]
+User=rogeriosousa
+WorkingDirectory=/home/rogeriosousa/evidencia_pipe
+Environment=PATH=/home/rogeriosousa/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=
+ExecStart=/home/rogeriosousa/.local/bin/uv run python backend/main.py
+```
+
+> A linha **`ExecStart=` vazia é obrigatória**. Em `Type=simple` o systemd só aceita um
+> `ExecStart`, e um drop-in que não zera o anterior falha com *"Service has more than
+> one ExecStart= setting"*. A linha vazia limpa a lista antes de definir a nova.
+
+Os `ExecStart` dos workers, para copiar (repare no `%%h` duplicado — o systemd
+desescapa para `%h`, que o Celery expande como hostname):
+
+```ini
+# evidencia-worker-light
+ExecStart=/home/rogeriosousa/.local/bin/uv run celery -A backend.celery_app worker -Q download,extract,llm -c 4 -E -n light@%%h
+
+# evidencia-worker-gpu
+ExecStart=/home/rogeriosousa/.local/bin/uv run celery -A backend.celery_app worker -Q gpu -c 1 -E -n gpu@%%h
+```
+
+Cuidados da opção B:
+
+- O usuário precisa de **escrita no repositório**: o `uv run` gerencia o `.venv`, e o
+  pipeline grava em `output/` e `data/`.
+- O **cache do tokenizer é por usuário** (`~/.cache/huggingface`). Pré-aqueça com o
+  mesmo usuário que vai rodar os serviços, senão o primeiro job baixa de novo — veja o
+  [passo 1](#1-código-e-dependências).
+- Se preferir rodar o `evidencia-compose` como o usuário também, ele precisa do grupo
+  docker: `sudo usermod -aG docker rogeriosousa` (exige novo login).
+
+### 7.2 Instalar
+
 ```bash
 cd deploy/systemd
 sudo ./install.sh          # copia as units, daemon-reload, enable e start
 systemctl --no-pager --plain list-units 'evidencia*'
+```
+
+Conferir o que ficou valendo depois dos drop-ins:
+
+```bash
+systemctl show evidencia-api -p User -p WorkingDirectory -p ExecStart
 ```
 
 Sobem quatro serviços sob o `evidencia.target`: `evidencia-compose` (oneshot que

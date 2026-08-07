@@ -19,7 +19,6 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "evidencia_chunks")
 
 # Modelo de embedding (bge-m3: dense 1024d + sparse lexical_weights).
 DENSE_MODEL = "BAAI/bge-m3"
-CACHE_DIR = "/root/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/5617a9f61b028005a4858fdac845db406aefb181/"
 
 # --------------------------------------------------------------------------
 # API de embedding (vLLM servindo o bge-m3) — ver backend/services/embedder.py.
