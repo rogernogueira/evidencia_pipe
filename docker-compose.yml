@@ -210,6 +210,10 @@ services:
   # HF_HUB_OFFLINE=1 — mesmo modelo dos serviços MinerU: a versão fica isolada na
   # imagem e o runtime não depende do cache do host nem da rede. As duas instâncias
   # compartilham a MESMA imagem; só o `--pooler-config.task` muda.
+  #
+  # `network_mode: host` → a porta vem do `--port` (não há mapeamento); os workers
+  # no host falam direto com 127.0.0.1. `ipc: host` dá memória compartilhada cheia
+  # ao vLLM. GPU via CDI (`nvidia.com/gpu=all`), equivalente ao `--gpus all`.
   vllm-bge-m3:
     build:
       context: ./deploy/vllm-bge-m3
@@ -217,28 +221,37 @@ services:
         VLLM_VERSION: "v0.26.0"
     image: evidencia_bge_m3:local
     container_name: vllm-bge-m3
-    command:
-      - "--model=BAAI/bge-m3"
-      - "--hf-overrides={\"architectures\":[\"BgeM3EmbeddingModel\"]}"
-      - "--pooler-config={\"task\":\"embed\"}"
-      - "--gpu-memory-utilization=0.12"
-      - "--max-model-len=8192"
-    ports:
-      - "8000:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: ["gpu"]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 180s
+
+    network_mode: host
+    ipc: host
+
+    devices:
+      - nvidia.com/gpu=all
+
+    command: >
+      --model ${EMBED_MODEL:-BAAI/bge-m3}
+      --served-model-name ${EMBED_API_MODEL:-BAAI/bge-m3}
+      --hf-overrides '{"architectures":["BgeM3EmbeddingModel"]}'
+      --pooler-config '{"task":"embed"}'
+      --host 0.0.0.0
+      --port ${EMBED_API_PORT:-8000}
+      --gpu-memory-utilization ${EMBED_GPU_UTIL:-0.12}
+      --max-model-len ${EMBED_MAX_LEN:-8192}
+
     restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${EMBED_API_PORT:-8000}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   vllm-bge-m3-sparse:
     build:
@@ -247,28 +260,37 @@ services:
         VLLM_VERSION: "v0.26.0"
     image: evidencia_bge_m3:local
     container_name: vllm-bge-m3-sparse
-    command:
-      - "--model=BAAI/bge-m3"
-      - "--hf-overrides={\"architectures\":[\"BgeM3EmbeddingModel\"]}"
-      - "--pooler-config={\"task\":\"token_classify\"}"
-      - "--gpu-memory-utilization=0.12"
-      - "--max-model-len=8192"
-    ports:
-      - "8001:8000"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: ["gpu"]
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 180s
+
+    network_mode: host
+    ipc: host
+
+    devices:
+      - nvidia.com/gpu=all
+
+    command: >
+      --model ${EMBED_MODEL:-BAAI/bge-m3}
+      --served-model-name ${EMBED_API_MODEL:-BAAI/bge-m3}
+      --hf-overrides '{"architectures":["BgeM3EmbeddingModel"]}'
+      --pooler-config '{"task":"token_classify"}'
+      --host 0.0.0.0
+      --port ${EMBED_API_SPARSE_PORT:-8001}
+      --gpu-memory-utilization ${EMBED_GPU_UTIL:-0.12}
+      --max-model-len ${EMBED_MAX_LEN:-8192}
+
     restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${EMBED_API_SPARSE_PORT:-8001}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 volumes:
   redis_data:
