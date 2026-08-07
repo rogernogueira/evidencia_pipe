@@ -43,7 +43,9 @@ Environment="COMPOSE_SERVICES=redis flower minio minio-init"
 ```
 
 As aspas são obrigatórias: sem elas o systemd quebra a linha em várias atribuições e
-só a primeira palavra vira a variável. Cenário completo em [`DEPLOY.md`](../../DEPLOY.md).
+só a primeira palavra vira a variável. Os serviços de GPU estão atrás do profile `gpu`,
+mas o unit os nomeia explicitamente — e nomear ativa o profile sozinho, então o
+`ExecStart` funciona sem `--profile`. Cenário completo em [`DEPLOY.md`](../../DEPLOY.md).
 
 ## Operar
 

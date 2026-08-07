@@ -91,6 +91,7 @@ services:
   # be empty". A porta 8011 evita conflito com serviços MinerU legados na 8010.
   # Os workers no HOST apontam MINERU_API_URL=http://127.0.0.1:8011.
   mineru:
+    profiles: ["gpu"]
     build:
       context: ./tmp
     image: evidencia_mineru:local
@@ -122,6 +123,7 @@ services:
   # MINERU_BACKEND=pipeline. Normalmente roda-se ESTE **ou** o "mineru" (VLM) — os
   # dois juntos podem estourar a VRAM numa GPU única.
   mineru-pipeline:
+    profiles: ["gpu"]
     build:
       context: ./tmp
     image: evidencia_mineru:local
@@ -215,6 +217,7 @@ services:
   # no host falam direto com 127.0.0.1. `ipc: host` dá memória compartilhada cheia
   # ao vLLM. GPU via CDI (`nvidia.com/gpu=all`), equivalente ao `--gpus all`.
   vllm-bge-m3:
+    profiles: ["gpu"]
     build:
       context: ./deploy/vllm-bge-m3
       args:
@@ -254,6 +257,7 @@ services:
         max-file: "3"
 
   vllm-bge-m3-sparse:
+    profiles: ["gpu"]
     build:
       context: ./deploy/vllm-bge-m3
       args:

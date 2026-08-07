@@ -118,13 +118,18 @@ systemd, verificação e troubleshooting), siga o [`DEPLOY.md`](DEPLOY.md).
 ```bash
 cp .env.example .env   # ajuste DSPACE_URL, QDRANT_URL, MINERU_API_URL, LLM_ENRICH_API_KEY, MINIO_*
 uv sync
-docker compose up -d redis minio minio-init          # Redis + MinIO (bucket privado + versionamento)
+docker compose up -d                                 # infra leve: Redis + MinIO + Flower
 docker compose up -d mineru-pipeline                 # MinerU pipeline-only (:8012, ~6,5 GB VRAM)
 docker compose up -d vllm-bge-m3 vllm-bge-m3-sparse  # embedding (:8000 denso, :8001 esparso)
 uv run python backend/main.py                        # sobe em http://127.0.0.1:8020
 ```
 
 ### MinerU: dois serviços (escolha por VRAM × qualidade)
+
+> Os serviços que exigem GPU (`mineru`, `mineru-pipeline`, `vllm-bge-m3`,
+> `vllm-bge-m3-sparse`) estão atrás do profile **`gpu`**: um `docker compose up -d` sem
+> argumentos sobe só a infra leve. Nomeá-los explicitamente (como acima) ativa o profile
+> sozinho; para subir tudo de uma vez, `docker compose --profile gpu up -d`.
 
 O `docker-compose.yml` define **dois** serviços MinerU (imagem única `evidencia_mineru:local`, de `tmp/Dockerfile`, base vLLM). Ambos exigem **`--gpus all`** (com device único o vLLM falha com `Device string must not be empty`). Numa GPU única, rode **um ou outro** — juntos estouram a VRAM.
 

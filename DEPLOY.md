@@ -19,7 +19,7 @@ boot é o `evidencia.target`.
 |---|---|---|
 | MinerU | contêiner local | remoto, via `MINERU_API_URL` |
 | Embedding | 2 contêineres vLLM locais | remoto, via `EMBED_API_*` |
-| Serviços locais | tudo | só Redis, MinIO e Flower |
+| Serviços locais | tudo (`--profile gpu`) | só Redis, MinIO e Flower (o padrão) |
 | Mudança de código | nenhuma | **nenhuma** |
 
 O backend é 100% desacoplado por HTTP e o venv do host **não tem `torch` nem
@@ -148,6 +148,11 @@ docker compose build mineru-pipeline      # evidencia_mineru:local (~30 GB)
 docker compose build vllm-bge-m3          # evidencia_bge_m3:local (~21 GB)
 ```
 
+Os quatro serviços que exigem GPU (`mineru`, `mineru-pipeline`, `vllm-bge-m3`,
+`vllm-bge-m3-sparse`) estão atrás do profile **`gpu`**, para nunca subirem por engano
+num host sem placa. Nomear o serviço explicitamente — como acima e como o systemd faz —
+já ativa o profile sozinho; só o `docker compose up -d` **sem argumentos** os ignora.
+
 O `vllm-bge-m3-sparse` reaproveita a mesma imagem do `vllm-bge-m3` — não precisa
 construir de novo.
 
@@ -164,10 +169,8 @@ docker run --rm --entrypoint /bin/bash evidencia_bge_m3:local \
 ## 5. Subir a infra
 
 ```bash
-docker compose up -d redis flower minio minio-init mineru-pipeline \
-                     vllm-bge-m3 vllm-bge-m3-sparse
-
-docker compose ps
+docker compose --profile gpu up -d
+docker compose --profile gpu ps
 ```
 
 Os dois vLLM levam **1–3 minutos** para ficar `healthy` (carga do modelo +
@@ -354,13 +357,19 @@ Se faltar uma instância, o [passo 4](#4-build-das-imagens) e o
 [`docker-compose.yml`](docker-compose.yml) deste repositório servem de referência —
 suba a que falta **no host da GPU**, numa porta livre, e aponte o `.env`.
 
-**Serviços a subir no host sem GPU** — só a infra leve:
+**Serviços a subir no host sem GPU** — só a infra leve, que é o padrão do compose:
 
 ```bash
-docker compose up -d redis flower minio minio-init
+docker compose up -d
 ```
 
-Nada de `mineru*` nem `vllm*`: exigem GPU e falhariam na subida.
+Sem `--profile gpu`, os quatro serviços de GPU nem são considerados: nada de build de
+imagem de 30 GB, nada de contêiner tentando abrir a placa. Confira com
+`docker compose config --services` — devem sair só `redis`, `flower`, `minio` e
+`minio-init`.
+
+**Você não precisa das imagens `evidencia_mineru:local` nem `evidencia_bge_m3:local`**
+neste host — pule o [passo 4](#4-build-das-imagens) inteiro.
 
 **No systemd**, encurte a lista de serviços sem editar o unit versionado:
 
