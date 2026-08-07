@@ -268,8 +268,16 @@ cd deploy/systemd && ./install.sh
 
 #### Opção B — rodar como usuário comum
 
-Instale os units normalmente e sobrescreva por **drop-in**, sem tocar nos arquivos
-versionados. Ajuste por unit:
+Aqui a **ordem importa**: o `systemctl edit` só funciona com o unit já instalado, e o
+`install.sh` sem argumento já *inicia* os serviços — que falhariam com os caminhos de
+root. Por isso instale com `--no-start`, aplique os drop-ins e só então suba:
+
+```bash
+cd deploy/systemd
+sudo ./install.sh --no-start      # copia e habilita, SEM iniciar
+```
+
+Agora sobrescreva por **drop-in**, sem tocar nos arquivos versionados. Ajuste por unit:
 
 | Unit | O que sobrescrever |
 |---|---|
@@ -323,19 +331,30 @@ Cuidados da opção B:
 - Se preferir rodar o `evidencia-compose` como o usuário também, ele precisa do grupo
   docker: `sudo usermod -aG docker rogeriosousa` (exige novo login).
 
-### 7.2 Instalar
+Com os drop-ins no lugar, suba o stack:
+
+```bash
+sudo systemctl start evidencia.target
+```
+
+### 7.2 Instalar (opção A) e conferir
+
+Na opção A, sem drop-in nenhum, o `install.sh` copia, habilita **e** inicia:
 
 ```bash
 cd deploy/systemd
-sudo ./install.sh          # copia as units, daemon-reload, enable e start
-systemctl --no-pager --plain list-units 'evidencia*'
+sudo ./install.sh
 ```
 
-Conferir o que ficou valendo depois dos drop-ins:
+Nos dois casos, confira o estado e o que de fato ficou valendo:
 
 ```bash
+systemctl --no-pager --plain list-units 'evidencia*'
 systemctl show evidencia-api -p User -p WorkingDirectory -p ExecStart
 ```
+
+O `systemctl show` é o que revela se o drop-in pegou — ele imprime o valor efetivo,
+já com as sobrescritas aplicadas.
 
 Sobem quatro serviços sob o `evidencia.target`: `evidencia-compose` (oneshot que
 garante a infra), `evidencia-api`, `evidencia-worker-light` e `evidencia-worker-gpu`.
