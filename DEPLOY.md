@@ -84,7 +84,45 @@ print('tokenizer em cache')"
 ```
 
 > Os units systemd assumem `/app/evidencia_pipe` e `uv` em `/root/.local/bin/uv`.
-> Em outro caminho, ajuste o `WorkingDirectory`/`ExecStart` em `deploy/systemd/`.
+> Em outro caminho, ajuste o `WorkingDirectory`/`ExecStart` em `deploy/systemd/`
+> — veja o [passo 7.1](#71-escolha-o-usuário-e-o-caminho-antes-de-instalar).
+
+### `sudo uv sync` → "uv: comando não encontrado"
+
+O `sudo` descarta o `PATH` do usuário e usa o `secure_path` do `/etc/sudoers`, que
+**não** inclui `~/.local/bin`. Daí o `uv` instalado para um usuário comum sumir sob
+`sudo`.
+
+**A solução é não usar `sudo`.** O `uv sync` não precisa de root — ele só cria o
+`.venv` dentro do repositório. Sob `sudo`, esses arquivos nascem `root:root` e o
+serviço rodando como usuário comum depois falha com *permission denied*:
+
+```bash
+sudo chown -R "$USER":"$USER" /app/evidencia_pipe   # o repo pertence a quem roda o app
+cd /app/evidencia_pipe && uv sync                   # sem sudo
+```
+
+Se já rodou com `sudo` e sobrou coisa de root:
+
+```bash
+sudo rm -rf .venv && sudo chown -R "$USER":"$USER" . && uv sync
+```
+
+> ⛔ **Não** acrescente `~/.local/bin` ao `secure_path` do sudoers. É exatamente o
+> buraco que o `secure_path` fecha: o diretório é gravável pelo usuário, então quem
+> escrever lá passa a ter o próprio binário executado **como root** no `sudo` seguinte
+> — escalada de privilégio direta. Pelo mesmo motivo, evite `sudo -E uv sync` e
+> `sudo env "PATH=$PATH" uv sync`: funcionam, mas continuam sujando o repositório com
+> arquivos de root.
+
+Se você **precisa** do `uv` para o root (só na [opção A](#opção-a--instalar-como-root-nada-a-ajustar),
+com os serviços rodando como root), instale-o num caminho de root em vez de apontar o
+sudo para o diretório do usuário:
+
+```bash
+sudo -i
+curl -LsSf https://astral.sh/uv/install.sh | sh     # → /root/.local/bin/uv
+```
 
 ---
 
