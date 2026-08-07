@@ -10,8 +10,22 @@ O sistema tem **três camadas**, e é isso que explica o formato do deploy:
 | Processos | Host, no venv (`systemd`) | API FastAPI + 2 workers Celery |
 | Externo | Fora deste repositório | **Qdrant** e o **DSpace** |
 
-Os processos do host ficam fora do Docker de propósito: eles falam com a GPU e leem
-o `.env` do diretório do projeto. Quem sobe tudo junto no boot é o `evidencia.target`.
+Os processos do host leem o `.env` do diretório do projeto. Quem sobe tudo junto no
+boot é o `evidencia.target`.
+
+**Existem dois cenários de instalação.** Escolha antes de continuar:
+
+| | Cenário A — host com GPU | Cenário B — host **sem** GPU |
+|---|---|---|
+| MinerU | contêiner local | remoto, via `MINERU_API_URL` |
+| Embedding | 2 contêineres vLLM locais | remoto, via `EMBED_API_*` |
+| Serviços locais | tudo | só Redis, MinIO e Flower |
+| Mudança de código | nenhuma | **nenhuma** |
+
+O backend é 100% desacoplado por HTTP e o venv do host **não tem `torch` nem
+`mineru`** — por isso o cenário B funciona sem adaptação. Os passos 1, 2, 7, 8 e 9
+valem para os dois; os passos 3–6 são do cenário A. O **[passo 10](#10-cenário-b--servidor-sem-gpu)**
+cobre o B.
 
 ---
 
@@ -269,6 +283,101 @@ systemctl restart evidencia-api evidencia-worker-light evidencia-worker-gpu
 docker compose build vllm-bge-m3
 docker compose up -d vllm-bge-m3 vllm-bge-m3-sparse
 ```
+
+---
+
+## 10. Cenário B — servidor sem GPU
+
+Aqui o servidor roda **só** a API, os workers e a infra leve; a extração e o embedding
+ficam num host com GPU. Nada de código muda — é tudo `.env` e quais serviços subir.
+
+Exemplo com o host de GPU em `172.16.115.60`, MinerU na `8004` e embedding na `8003`:
+
+```dotenv
+MINERU_API_URL=http://172.16.115.60:8004
+MINERU_BACKEND=pipeline            # tem de casar com o que roda LÁ
+
+EMBED_API_URL=http://172.16.115.60:8003          # instância da task `embed`
+EMBED_API_SPARSE_URL=http://172.16.115.60:????   # instância da task `token_classify`
+
+# Sem GPU local não há o que arbitrar: o lock envolveria uma chamada HTTP a uma
+# GPU que não é deste host, serializando o pipeline à toa.
+GPU_MANAGER_ENABLED=false
+```
+
+> ⚠️ **Confirme quantas instâncias de embedding existem no host remoto.** O backend
+> precisa de **duas**: uma servindo a task `embed` (vetor denso) e outra servindo
+> `token_classify` (vetor esparso). Um único vLLM atende **uma** task só — se a `8003`
+> for a única, metade do contrato não existe e a busca híbrida fica sem a perna
+> lexical. O motivo está em [`backend/services/embedder.py`](backend/services/embedder.py).
+
+Rode **no host da GPU** para descobrir qual task a `8003` serve. Não use `/v1/models`
+para isso — ele responde `200` nas duas, só lista o modelo. Quem discrimina é o par
+abaixo (códigos verificados nas duas instâncias):
+
+```bash
+P=8003
+curl -s -o /dev/null -w "v1/embeddings:%{http_code} " -X POST http://127.0.0.1:$P/v1/embeddings \
+  -H 'Content-Type: application/json' -d '{"model":"BAAI/bge-m3","input":["teste"]}'
+curl -s -o /dev/null -w "pooling:%{http_code}\n" -X POST http://127.0.0.1:$P/pooling \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"BAAI/bge-m3","input":["teste"],"task":"token_classify"}'
+```
+
+| Resposta | Instância | O que falta |
+|---|---|---|
+| `v1/embeddings:200  pooling:400` | **densa** (`embed`) | subir a esparsa com `--pooler-config '{"task":"token_classify"}'` noutra porta |
+| `v1/embeddings:501  pooling:200` | **esparsa** (`token_classify`) | subir a densa com `--pooler-config '{"task":"embed"}'` |
+| `v1/embeddings:501  pooling:500` | nenhuma das duas | o servidor caiu na task combinada; falta o `--pooler-config.task` explícito |
+
+Se o `/pooling` responder `200` mas o vetor esparso vier vazio na prática, o
+`--hf-overrides` não chegou íntegro — veja *Problemas conhecidos*.
+
+Se faltar uma instância, o [passo 4](#4-build-das-imagens) e o
+[`docker-compose.yml`](docker-compose.yml) deste repositório servem de referência —
+suba a que falta **no host da GPU**, numa porta livre, e aponte o `.env`.
+
+**Serviços a subir no host sem GPU** — só a infra leve:
+
+```bash
+docker compose up -d redis flower minio minio-init
+```
+
+Nada de `mineru*` nem `vllm*`: exigem GPU e falhariam na subida.
+
+**No systemd**, encurte a lista de serviços sem editar o unit versionado:
+
+```bash
+sudo systemctl edit evidencia-compose
+```
+
+```ini
+[Service]
+Environment="COMPOSE_SERVICES=redis flower minio minio-init"
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart evidencia-compose
+```
+
+**Rede.** O host sem GPU precisa alcançar, além do Qdrant e do DSpace, as portas de
+MinerU e embedding no host da GPU. Confirme antes de instalar — de dentro do servidor:
+
+```bash
+for hp in 172.16.115.60:8004 172.16.115.60:8003; do
+  timeout 5 bash -c "cat < /dev/null > /dev/tcp/${hp/:/\/}" \
+    && echo "$hp alcançável" || echo "$hp INALCANÇÁVEL"
+done
+```
+
+Do outro lado, os contêineres vLLM sobem com `network_mode: host`, então escutam em
+`0.0.0.0` — exponha as portas só para a rede interna.
+
+**Tudo em CPU, sem host de GPU nenhum?** É outra conversa, não coberta aqui. O MinerU
+até roda (`MINERU_DEVICE_MODE=cpu` + `MINERU_BACKEND=pipeline`, bem mais lento), mas o
+embedding não tem saída pronta: **não existe imagem CPU oficial do `vllm/vllm-openai`**
+— seria preciso construir o vLLM do fonte (`docker/Dockerfile.cpu`) ou reintroduzir o
+caminho local com FlagEmbedding em CPU, removido na migração para a API.
 
 ---
 

@@ -10,7 +10,7 @@ num alvo único.
 
 | Arquivo | Papel |
 |---|---|
-| `evidencia-compose.service` | oneshot: `docker compose up -d redis flower minio minio-init mineru-pipeline vllm-bge-m3 vllm-bge-m3-sparse` (`ExecStop` = `docker compose stop`) |
+| `evidencia-compose.service` | oneshot: `docker compose up -d $COMPOSE_SERVICES` (`ExecStop` = `docker compose stop`) |
 | `evidencia-api.service` | API FastAPI — `uv run python backend/main.py` (:8181, via `PORT` no `.env`) |
 | `evidencia-worker-light.service` | worker leve — filas `download,extract,llm`, `-c 4` |
 | `evidencia-worker-gpu.service` | worker GPU — fila `gpu`, `-c 1`, `WORKER_ROLE=gpu` (sonda a API de embedding na subida) |
@@ -25,6 +25,25 @@ Redis/MinIO) e `Restart=on-failure`. O `evidencia-compose` roda `After=docker.se
 sudo ./install.sh              # copia, daemon-reload, enable e start
 sudo ./install.sh --no-start   # instala e habilita, sem iniciar agora
 ```
+
+## Serviços da infra (`COMPOSE_SERVICES`)
+
+O `ExecStart` do `evidencia-compose` usa a variável `COMPOSE_SERVICES`, cujo default
+cobre o host com GPU (`redis flower minio minio-init mineru-pipeline vllm-bge-m3
+vllm-bge-m3-sparse`). Num host **sem GPU** — MinerU e embedding remotos — encurte a
+lista com um drop-in, sem editar o unit versionado:
+
+```bash
+sudo systemctl edit evidencia-compose
+```
+
+```ini
+[Service]
+Environment="COMPOSE_SERVICES=redis flower minio minio-init"
+```
+
+As aspas são obrigatórias: sem elas o systemd quebra a linha em várias atribuições e
+só a primeira palavra vira a variável. Cenário completo em [`DEPLOY.md`](../../DEPLOY.md).
 
 ## Operar
 

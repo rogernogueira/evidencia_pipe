@@ -18,7 +18,12 @@ PartOf=evidencia.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/app/evidencia_pipe
-ExecStart=/usr/bin/docker compose up -d redis flower minio minio-init mineru-pipeline vllm-bge-m3 vllm-bge-m3-sparse
+# A lista de serviços é uma variável para o host sem GPU poder encurtá-la sem
+# editar este arquivo (systemd faz word splitting em $VAR sem aspas):
+#   systemctl edit evidencia-compose  →  [Service]
+#                                        Environment="COMPOSE_SERVICES=redis flower minio minio-init"
+Environment="COMPOSE_SERVICES=redis flower minio minio-init mineru-pipeline vllm-bge-m3 vllm-bge-m3-sparse"
+ExecStart=/usr/bin/docker compose up -d $COMPOSE_SERVICES
 ExecStop=/usr/bin/docker compose stop
 TimeoutStartSec=0
 
