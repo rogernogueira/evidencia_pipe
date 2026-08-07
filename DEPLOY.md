@@ -295,7 +295,7 @@ Exemplo com o host de GPU em `172.16.115.60`, MinerU na `8004` e embedding na `8
 
 ```dotenv
 MINERU_API_URL=http://172.16.115.60:8004
-MINERU_BACKEND=pipeline            # tem de casar com o que roda LÁ
+MINERU_BACKEND=hybrid-engine       # tem de casar com o que roda LÁ
 
 EMBED_API_URL=http://172.16.115.60:8003          # instância da task `embed`
 EMBED_API_SPARSE_URL=http://172.16.115.60:????   # instância da task `token_classify`
@@ -303,6 +303,23 @@ EMBED_API_SPARSE_URL=http://172.16.115.60:????   # instância da task `token_cla
 # Sem GPU local não há o que arbitrar: o lock envolveria uma chamada HTTP a uma
 # GPU que não é deste host, serializando o pipeline à toa.
 GPU_MANAGER_ENABLED=false
+```
+
+O `MINERU_BACKEND` vai direto no campo `backend` do POST `/tasks`, e a API valida
+contra um enum fechado — **`hybrid` não existe**, o nome é `hybrid-engine`. Valores
+aceitos, conferidos no `/openapi.json` do servidor:
+
+```
+pipeline · vlm-engine · hybrid-engine · vlm-http-client · hybrid-http-client
+```
+
+Confirme o que a `8004` aceita (não processa nada, só lê o schema):
+
+```bash
+curl -s http://172.16.115.60:8004/openapi.json | python3 -c "
+import sys,json; d=json.load(sys.stdin)
+s=d['components']['schemas']['Body_submit_parse_task_tasks_post']['properties']['backend']
+print('backends aceitos:', s['enum'])"
 ```
 
 > ⚠️ **Confirme quantas instâncias de embedding existem no host remoto.** O backend
