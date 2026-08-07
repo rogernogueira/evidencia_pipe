@@ -112,12 +112,16 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 
 ## Como rodar
 
+Atalho para desenvolvimento. Para uma instalação do zero (build das imagens, Qdrant,
+systemd, verificação e troubleshooting), siga o [`DEPLOY.md`](DEPLOY.md).
+
 ```bash
 cp .env.example .env   # ajuste DSPACE_URL, QDRANT_URL, MINERU_API_URL, LLM_ENRICH_API_KEY, MINIO_*
 uv sync
-docker compose up -d redis minio minio-init   # Redis + MinIO (bucket privado + versionamento)
-docker compose up -d mineru-pipeline          # MinerU pipeline-only (:8012, ~6,5 GB VRAM)
-uv run python backend/main.py                  # sobe em http://127.0.0.1:8020
+docker compose up -d redis minio minio-init          # Redis + MinIO (bucket privado + versionamento)
+docker compose up -d mineru-pipeline                 # MinerU pipeline-only (:8012, ~6,5 GB VRAM)
+docker compose up -d vllm-bge-m3 vllm-bge-m3-sparse  # embedding (:8000 denso, :8001 esparso)
+uv run python backend/main.py                        # sobe em http://127.0.0.1:8020
 ```
 
 ### MinerU: dois serviços (escolha por VRAM × qualidade)
