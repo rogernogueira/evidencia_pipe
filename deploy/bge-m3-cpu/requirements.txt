@@ -1,0 +1,8 @@
+# torch vem do índice CPU (ver Dockerfile): a wheel default arrasta ~2,5 GB de
+# CUDA que nunca seria usada aqui.
+torch
+transformers>=4.40
+huggingface_hub
+fastapi>=0.135.2
+uvicorn>=0.42.0
+pydantic>=2

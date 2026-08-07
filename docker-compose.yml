@@ -296,6 +296,58 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  # Embedding em CPU — alternativa aos DOIS serviços vLLM acima, para host sem
+  # GPU nenhuma (`vllm/vllm-openai` é CUDA-only). Atrás do profile "cpu", então
+  # `docker compose up -d` NÃO o sobe; é preciso pedir explicitamente:
+  #
+  #   docker compose --profile cpu build bge-m3-cpu
+  #   docker compose --profile cpu up -d bge-m3-cpu
+  #
+  # UM contêiner serve as duas pooling tasks (o split em dois é limitação do
+  # servidor HTTP do vLLM, não do modelo). Aponte as DUAS variáveis para ele:
+  #
+  #   EMBED_API_URL=http://127.0.0.1:8000
+  #   EMBED_API_SPARSE_URL=http://127.0.0.1:8000
+  #
+  # Ordens de magnitude mais lento que a GPU: serve para busca (uma query por
+  # vez), não para reindexar o acervo.
+  bge-m3-cpu:
+    profiles: ["cpu"]
+    build:
+      context: ./deploy/bge-m3-cpu
+      args:
+        EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-m3}
+    image: evidencia_bge_m3_cpu:local
+    container_name: bge-m3-cpu
+
+    network_mode: host
+
+    environment:
+      EMBED_API_MODEL: ${EMBED_API_MODEL:-BAAI/bge-m3}
+      EMBED_MAX_LEN: ${EMBED_MAX_LEN:-8192}
+      # Threads intra-op do torch. Deixe abaixo do total de núcleos se o host
+      # também roda os workers Celery.
+      OMP_NUM_THREADS: ${EMBED_CPU_THREADS:-8}
+      EMBED_CPU_MAX_BATCH_TOKENS: ${EMBED_CPU_MAX_BATCH_TOKENS:-16384}
+
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0",
+              "--port", "${EMBED_API_PORT:-8000}", "--workers", "1"]
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${EMBED_API_PORT:-8000}/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
 volumes:
   redis_data:
   minio_data:

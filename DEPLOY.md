@@ -539,11 +539,50 @@ done
 Do outro lado, os contêineres vLLM sobem com `network_mode: host`, então escutam em
 `0.0.0.0` — exponha as portas só para a rede interna.
 
-**Tudo em CPU, sem host de GPU nenhum?** É outra conversa, não coberta aqui. O MinerU
-até roda (`MINERU_DEVICE_MODE=cpu` + `MINERU_BACKEND=pipeline`, bem mais lento), mas o
-embedding não tem saída pronta: **não existe imagem CPU oficial do `vllm/vllm-openai`**
-— seria preciso construir o vLLM do fonte (`docker/Dockerfile.cpu`) ou reintroduzir o
-caminho local com FlagEmbedding em CPU, removido na migração para a API.
+### Tudo em CPU, sem host de GPU nenhum
+
+O MinerU roda com `MINERU_DEVICE_MODE=cpu` + `MINERU_BACKEND=pipeline` (bem mais lento).
+
+Para o embedding **não** dá para reaproveitar os serviços vLLM: `vllm/vllm-openai` é
+CUDA-only e não há imagem CPU oficial. O TEI (`text-embeddings-inference:cpu-*`) também
+não resolve — o `/embed_sparse` dele exige um modelo `ForMaskedLM`, e o head esparso do
+bge-m3 é o `sparse_linear.pt`, um linear à parte; daria só o denso, e com pesos lexicais
+incompatíveis com os que já estão indexados.
+
+A saída é o serviço [`bge-m3-cpu`](deploy/bge-m3-cpu/), que reimplementa as duas pooling
+tasks em PyTorch CPU servindo as MESMAS rotas do vLLM (`/v1/models`, `/v1/embeddings`,
+`/pooling`) — o `backend/services/embedder.py` não muda:
+
+```bash
+docker compose --profile cpu build bge-m3-cpu
+docker compose --profile cpu up -d bge-m3-cpu
+```
+
+Um contêiner só serve as duas tasks (o split em dois é limitação do servidor HTTP do
+vLLM, não do modelo), então as duas variáveis apontam para a mesma porta:
+
+```dotenv
+EMBED_API_URL=http://127.0.0.1:8000
+EMBED_API_SPARSE_URL=http://127.0.0.1:8000
+EMBED_CPU_THREADS=8              # threads intra-op do torch
+EMBED_CPU_MAX_BATCH_TOKENS=16384 # teto de tokens por passada (segura a RAM)
+```
+
+Custo: ~4,6 GB de RAM (float32 — a CPU não tem caminho bom para fp16). Medido com 8
+threads num host de 16 núcleos, contra os contêineres vLLM na mesma máquina:
+
+| | GPU (vLLM) | CPU (shim) |
+|---|---|---|
+| query única (12 tokens), dense+sparse | 52 ms | 189 ms |
+| lote de 32 chunks (~283 tokens cada) | 60,7 chunks/s | 0,8 chunks/s |
+
+**Serve para busca, não para reindexar o acervo**: nessa taxa, reindexar os ~21 mil
+chunks levaria ~7,6 h.
+
+Paridade verificada contra os contêineres vLLM que geraram o índice atual: cosseno do
+denso ≥ 0,999999, chaves esparsas idênticas e `|Δpeso| ≤ 1,9e-4` (float32 CPU × fp16
+GPU) — a mesma ordem de grandeza da paridade vLLM↔FlagEmbedding. Os vetores gerados aqui
+são intercambiáveis com os já indexados.
 
 ---
 
