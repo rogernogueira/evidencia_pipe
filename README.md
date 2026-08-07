@@ -152,9 +152,13 @@ Resposta `202` com a lista de jobs criados (um por PDF). Acompanhe cada um em
 - **MinerU API** acessível em `MINERU_API_URL` (usa GPU).
 - **Qdrant** acessível em `QDRANT_URL`.
 - **API de embedding** (docker-compose): `vllm-bge-m3` (denso, `EMBED_API_URL`) e
-  `vllm-bge-m3-sparse` (esparso, `EMBED_API_SPARSE_URL`). O backend não carrega mais o
-  modelo — só o tokenizer do **BAAI/bge-m3** (cache HuggingFace), usado no chunking por
-  tokens e no alinhamento dos `lexical_weights`. Sem a API não há indexação nem busca.
+  `vllm-bge-m3-sparse` (esparso, `EMBED_API_SPARSE_URL`), ambos da imagem
+  `evidencia_bge_m3:local` (`deploy/vllm-bge-m3/Dockerfile`), com os **pesos assados
+  dentro** e `HF_HUB_OFFLINE=1` — como os serviços MinerU, a versão fica isolada na
+  imagem e o runtime não depende do cache do host nem da rede. O backend não carrega
+  mais o modelo — só o tokenizer do **BAAI/bge-m3** (cache HuggingFace), usado no
+  chunking por tokens e no alinhamento dos `lexical_weights`. Sem a API não há
+  indexação nem busca.
 - `LLM_ENRICH_API_KEY` (ou o legado `DEEPSEEK_API_KEY`) para o enrich por LLM — **opcional e desacoplado**; sem ela o enrich é pulado e a indexação segue normalmente.
 - **Redis** (docker-compose): DB 0 = broker Celery, DB 1 = job_store (+ lock do
   manifesto), DB 2 = coordenação da GPU (`gpu_resource_manager`).

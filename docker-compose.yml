@@ -204,10 +204,18 @@ services:
   # (~2,3 GB fp16), então as duas réplicas cabem folgadas e respondem em paralelo.
   #
   # `--hf-overrides` é obrigatório: sem ele o vLLM carrega o bge-m3 como XLM-R puro
-  # (só denso) e o `sparse_linear.pt` nunca é lido. O cache do HF é montado do host
-  # para não rebaixar o modelo a cada recriação.
+  # (só denso) e o `sparse_linear.pt` nunca é lido.
+  #
+  # Imagem própria (deploy/vllm-bge-m3/Dockerfile) com os pesos ASSADOS DENTRO e
+  # HF_HUB_OFFLINE=1 — mesmo modelo dos serviços MinerU: a versão fica isolada na
+  # imagem e o runtime não depende do cache do host nem da rede. As duas instâncias
+  # compartilham a MESMA imagem; só o `--pooler-config.task` muda.
   vllm-bge-m3:
-    image: vllm/vllm-openai:v0.26.0
+    build:
+      context: ./deploy/vllm-bge-m3
+      args:
+        VLLM_VERSION: "v0.26.0"
+    image: evidencia_bge_m3:local
     container_name: vllm-bge-m3
     command:
       - "--model=BAAI/bge-m3"
@@ -215,8 +223,6 @@ services:
       - "--pooler-config={\"task\":\"embed\"}"
       - "--gpu-memory-utilization=0.12"
       - "--max-model-len=8192"
-    volumes:
-      - ${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface
     ports:
       - "8000:8000"
     deploy:
@@ -235,7 +241,11 @@ services:
     restart: unless-stopped
 
   vllm-bge-m3-sparse:
-    image: vllm/vllm-openai:v0.26.0
+    build:
+      context: ./deploy/vllm-bge-m3
+      args:
+        VLLM_VERSION: "v0.26.0"
+    image: evidencia_bge_m3:local
     container_name: vllm-bge-m3-sparse
     command:
       - "--model=BAAI/bge-m3"
@@ -243,8 +253,6 @@ services:
       - "--pooler-config={\"task\":\"token_classify\"}"
       - "--gpu-memory-utilization=0.12"
       - "--max-model-len=8192"
-    volumes:
-      - ${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface
     ports:
       - "8001:8000"
     deploy:
