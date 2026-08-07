@@ -261,12 +261,6 @@ def stage_mineru(ctx: PipelineContext, *, task_id: str | None = None) -> Pipelin
         out_dir.mkdir()
 
         proc_result = process_pdf(pdf_local, out_dir, task_id=task_id, document_id=document_id)
-        try:
-            from backend.services.report_logs import write_process_log
-
-            write_process_log(proc_result)
-        except Exception as exc:  # CSV é best-effort
-            log.warning("[mineru] falha ao gravar relatório de processamento: %s", exc)
         if proc_result.get("status") != "Sucesso":
             raise RuntimeError(f"MinerU falhou para {document_id}")
 
@@ -462,13 +456,6 @@ def stage_index(ctx: PipelineContext, *, task_id: str | None = None) -> dict:
             chunks_jsonl_path=chunks_jsonl, chunking_report_path=chunking_report_local,
             upsert_batch_size=settings.QDRANT_UPSERT_BATCH_SIZE,
         )
-        try:
-            from backend.services.report_logs import write_embed_log
-
-            write_embed_log(result)
-        except Exception as exc:
-            log.warning("[index] falha ao gravar relatório de embeddings: %s", exc)
-
         chunks_ref = None
         if settings.ARTIFACT_KEEP_CHUNKS and chunks_jsonl.exists():
             chunks_ref = store.put_file(

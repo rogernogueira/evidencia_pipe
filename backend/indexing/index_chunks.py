@@ -10,7 +10,6 @@ Uso:
 """
 
 import argparse
-import csv
 import json
 import logging
 import os
@@ -39,7 +38,6 @@ COLLECTION_NAME = QDRANT_COLLECTION  # alinhado com a busca (backend.core.config
 # QDRANT_URL vem de backend.core.config (override por env). Antes era hardcoded aqui,
 # o que fazia o worker de GPU ignorar o env e sempre usar o IP fixo da rede.
 CONTENT_LIST_SUFFIX = "_content_list_v2.json"
-EMBEDDING_REPORT_PATH = Path("relatorio_embeddings.csv")
 
 # bge-m3: dense (1024d) + sparse (lexical_weights) — tudo via API vLLM
 DENSE_MODEL = "BAAI/bge-m3"
@@ -794,25 +792,6 @@ def sync_llm_metadata_to_qdrant(doc_id: str) -> int:
     return push_llm_metadata_to_qdrant(doc_id, payload)
 
 
-EMBEDDING_CSV_HEADERS = [
-    "doc_id", "timestamp", "n_chunks", "total_chars",
-    "chunk_time_s", "embed_time_s", "upsert_time_s", "total_time_s",
-    "chars_per_s", "ram_delta_mb", "ram_peak_mb", "vram_peak_mb",
-    "avg_sparse_tokens", "status",
-]
-
-
-def save_embedding_report(metrics_list: list[dict]) -> None:
-    """Salva o relatorio de embeddings em CSV (append ou cria)."""
-    file_exists = EMBEDDING_REPORT_PATH.exists()
-    with open(EMBEDDING_REPORT_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=EMBEDDING_CSV_HEADERS, extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(metrics_list)
-    log.info("Relatorio de embeddings salvo em '%s' (%d entradas).", EMBEDDING_REPORT_PATH, len(metrics_list))
-
-
 def index_all(client: QdrantClient, reset: bool, embedder: BgeM3EmbedderService, dense_dim: int, enable_llm_repair: bool = False, llm_model: str = "gemma4:latest") -> None:
     """Indexa todos os documentos encontrados em output/."""
     log.info("Inicio da indexacao em lote.")
@@ -830,15 +809,9 @@ def index_all(client: QdrantClient, reset: bool, embedder: BgeM3EmbedderService,
     print()
     setup_collection(client, reset, dense_dim=dense_dim)
 
-    # Limpa o CSV se existir e reset foi solicitado
-    if reset and EMBEDDING_REPORT_PATH.exists():
-        EMBEDDING_REPORT_PATH.unlink()
-        log.info("Relatorio de embeddings anterior removido (--reset).")
-
     chunker = MinerUChunker(enable_llm_repair=enable_llm_repair, llm_model=llm_model)
     log.info("Chunker inicializado: max_chunk_chars=%d overlap_chars=%d llm_repair=%s", chunker.max_chunk_chars, chunker.overlap_chars, enable_llm_repair)
 
-    all_metrics: list[dict] = []
     total_chunks = 0
     errors = 0
     skipped = 0
@@ -854,31 +827,19 @@ def index_all(client: QdrantClient, reset: bool, embedder: BgeM3EmbedderService,
             metrics = index_document(client, json_path, chunker, embedder)
             n = metrics["n_chunks"]
             total_chunks += n
-            all_metrics.append(metrics)
             log.info("Documento '%s' indexado com sucesso (%d chunk(s)).", doc_name, n)
         except Exception as exc:
             errors += 1
             print(f"\nErro ao indexar '{doc_name}': {exc}")
             log.exception("Falha ao indexar documento '%s'.", doc_name)
-            all_metrics.append({
-                "doc_id": doc_name, "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "n_chunks": 0, "total_chars": 0,
-                "chunk_time_s": 0.0, "embed_time_s": 0.0, "upsert_time_s": 0.0, "total_time_s": 0.0,
-                "chars_per_s": 0.0, "ram_delta_mb": 0.0, "ram_peak_mb": 0.0, "vram_peak_mb": 0.0,
-                "avg_sparse_tokens": 0.0, "status": f"erro: {exc}",
-            })
 
     print(f"\r{progress_bar(len(json_files), len(json_files))} {len(json_files)}/{len(json_files)} | concluido")
-
-    if all_metrics:
-        save_embedding_report(all_metrics)
 
     print(f"\n{'=' * 55}")
     print(f"Total: {total_chunks} chunks | {len(json_files) - errors - skipped} ok | {skipped} pulado(s) | {errors} erro(s)")
     if enable_llm_repair:
         repair_info = chunker.rejection_summary
         print(f"Chunks reparados via LLM: {repair_info.get('total_repaired', 0)}")
-    print(f"Relatorio salvo em: {EMBEDDING_REPORT_PATH}")
     print(f"Collection: '{COLLECTION_NAME}' no Qdrant ({QDRANT_URL})")
     print(f"{'=' * 55}\n")
     log.info(
