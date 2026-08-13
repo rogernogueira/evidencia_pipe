@@ -381,7 +381,7 @@ def main() -> int:
     checa_embedding(env, dim)
     checa_redis(env)
     checa_http_simples("MinerU", cfg(env, "MINERU_API_URL", "http://127.0.0.1:8010"),
-                       "/docs", "sem MinerU não há extração; a busca no que já foi "
+                       "/health", "sem MinerU não há extração; a busca no que já foi "
                                 "indexado continua funcionando.")
     checa_minio(env)
     checa_http_simples("DSpace", cfg(env, "DSPACE_URL", "https://rdapp.comais.uft.edu.br"),
