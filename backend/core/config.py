@@ -66,6 +66,20 @@ MINERU_LANG = os.getenv("MINERU_LANG", "latin").strip()
 # {DSPACE_URL}/server/api/core/bitstreams/{uuid}/content
 DSPACE_URL = os.getenv("DSPACE_URL", "https://rdapp.comais.uft.edu.br")
 
+# --------------------------------------------------------------------------
+# Proxy reverso que REMOVE o prefixo do caminho (ver DEPLOY.md §8.1 e
+# backend/api/proxy_prefix.py). Vazio = comportamento normal, sem middleware.
+# Só preencha (com "/api") onde a borda estiver com ProxyPass reescrevendo para a
+# raiz do backend; é remendo de uma configuração errada, não o modo esperado.
+# --------------------------------------------------------------------------
+PROXY_STRIPPED_PREFIX = os.getenv("PROXY_STRIPPED_PREFIX", "").strip().rstrip("/")
+if PROXY_STRIPPED_PREFIX and not PROXY_STRIPPED_PREFIX.startswith("/"):
+    PROXY_STRIPPED_PREFIX = "/" + PROXY_STRIPPED_PREFIX
+# Com o prefixo removido, a raiz do backend (docs, /internal/*, /output) fica
+# publicada junto. Ligado, o middleware devolve 404 nessas rotas para quem chega
+# pelo proxy. Desligue só se algum consumidor legítimo passar pela borda.
+PROXY_GUARD_ADMIN = os.getenv("PROXY_GUARD_ADMIN", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # Redis — broker do Celery (orquestração do pipeline) e backing do job_store
 # (status compartilhado entre o processo da API e os workers). DB 0 = broker,
 # DB 1 = job_store, para não misturar as chaves.

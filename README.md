@@ -110,6 +110,13 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 > demanda, nunca persistida no manifesto/logs). O bucket é **privado** (sem acesso
 > anônimo).
 
+Na instalação do IBICT a API é publicada por um proxy reverso na borda:
+**`https://devrdapp.ibict.br/api/...`** (mesmos caminhos da tabela). Só as rotas
+`/api/*` são publicadas — `/health`, `/docs`, `/output` e `/internal/*` seguem
+restritos à rede interna. Onde a borda remover o prefixo `/api`, o backend recoloca
+via `PROXY_STRIPPED_PREFIX` e barra a raiz administrativa. Detalhes, conferência e
+o remendo: [DEPLOY.md §8.1](DEPLOY.md).
+
 ## Como rodar
 
 Atalho para desenvolvimento. Para uma instalação do zero (build das imagens, Qdrant,

@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.core.config import BASE_DIR, OUTPUT_DIR
 from backend.core.logger import log
+from backend.api.proxy_prefix import instala_acomodacao_de_proxy
 from backend.api.router import api_router
 
 APP_PORT = int(os.getenv("PORT", "8020"))
@@ -89,6 +90,10 @@ app.include_router(api_router)
 # Serve os artefatos gerados (markdown, imagens, JSONs) sob /output.
 OUTPUT_STATIC = OUTPUT_DIR if OUTPUT_DIR.exists() else BASE_DIR
 app.mount("/output", StaticFiles(directory=str(OUTPUT_STATIC)), name="output")
+
+# Depois do router e do mount: o middleware deriva das rotas já registradas quais
+# caminhos pode recolocar sob o prefixo. No-op sem PROXY_STRIPPED_PREFIX no .env.
+instala_acomodacao_de_proxy(app)
 
 
 if __name__ == "__main__":

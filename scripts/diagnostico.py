@@ -8,6 +8,7 @@ de `qdrant-client`.
     python3 scripts/diagnostico.py                  # lê o .env do repositório
     python3 scripts/diagnostico.py --env /etc/evidencia/.env
     python3 scripts/diagnostico.py --api-port 8181  # também checa a API local
+    python3 scripts/diagnostico.py --public-url https://devrdapp.ibict.br
 
 Cada linha sai como [OK], [AVISO] ou [FALHA]. Falha = indexação ou busca não
 funcionam; aviso = degradação ou coisa que só morde num cenário específico.
@@ -337,6 +338,105 @@ def checa_api_local(porta: int) -> None:
         print("            as seções acima dizem qual dos dois.")
 
 
+def api_json(url: str, timeout: float = 20.0) -> Tuple[Optional[int], Any]:
+    """GET que distingue "respondeu a API" de "respondeu outra coisa".
+
+    O vhost da borda tem catch-all do Angular: qualquer caminho NÃO proxiado
+    devolve 200 com o HTML do DSpace. Olhar só o código de status faz todo
+    caminho parecer existir — por isso o corpo tem de ser JSON. Erros da API
+    (404, 503) também identificam a API, então o HTTPError é lido, não engolido.
+
+    Devolve (status, json) — json=None quando o corpo não é JSON.
+    """
+    try:
+        status, corpo = http_get(url, timeout)
+    except urllib.error.HTTPError as exc:
+        status, corpo = exc.code, exc.read()
+    except Exception:
+        return None, None
+    try:
+        return status, json.loads(corpo)
+    except ValueError:
+        return status, None
+
+
+def checa_api_publica(public_url: str) -> None:
+    """Confere a API atrás do proxy reverso da borda (devrdapp.ibict.br)."""
+    base = public_url.rstrip("/")
+    secao(f"API pública (proxy da borda) — {base}")
+
+    def diz_como_corrigir() -> None:
+        print("            Na borda, o ProxyPass tem barra final (ou aponta para a")
+        print("            raiz do backend): '/api/ → http://<host>:8020/' tira o")
+        print("            prefixo. O correto é sem reescrita:")
+        print("              ProxyPass        /api  http://<host>:8020/api  timeout=120 retry=0")
+        print("              ProxyPassReverse /api  http://<host>:8020/api")
+
+    # Detector do strip, independente de o backend estar compensando: /health
+    # existe na RAIZ do backend, e nenhuma rota responde em /api/health. Se a
+    # borda repassa sem reescrever, isto dá 404; se ela remove o prefixo, o
+    # request chega em /health e volta o JSON do health.
+    status_health, health = api_json(f"{base}/api/health")
+    remove_prefixo = status_health == 200 and isinstance(health, dict) and "service" in health
+
+    # Rotas de verdade, do jeito que um cliente as chama.
+    _, direto = api_json(f"{base}/api/search/status")
+    respondem = isinstance(direto, dict) and "semantic" in direto
+
+    if respondem and not remove_prefixo:
+        linha("OK", "GET /api/search/status", f"semantic={direto.get('semantic')}")
+        # No layout correto a raiz do backend não é publicada. Ainda assim
+        # sondamos: um ProxyPass extra (ou um / apontado para a API) vazaria.
+        raiz_backend = base
+    elif respondem:
+        # A borda continua errada, mas o backend está recolocando o prefixo
+        # (PROXY_STRIPPED_PREFIX). Funciona, e ainda assim é remendo: quem depurar
+        # o caminho de um request precisa saber que existe uma reescrita no meio.
+        linha("AVISO", "a borda remove /api e o backend está compensando",
+              "PROXY_STRIPPED_PREFIX ativo; as rotas respondem")
+        print("          → o remendo vive em backend/api/proxy_prefix.py. Corrigir a")
+        print("            borda e apagar a variável continua sendo o desfecho:")
+        diz_como_corrigir()
+        raiz_backend = f"{base}/api"
+    elif remove_prefixo:
+        linha("FALHA", "a borda remove /api e nada compensa",
+              f"as rotas só respondem em {base}/api/api/...")
+        print("          → corrija a borda ou, se ela não for sua, ligue o remendo do")
+        print("            backend: PROXY_STRIPPED_PREFIX=/api no .env (DEPLOY.md §8.1).")
+        diz_como_corrigir()
+        raiz_backend = f"{base}/api"
+    else:
+        linha("FALHA", "a API não responde nesta URL",
+              "/api/... não devolveu JSON da API, e /api/health não é da API")
+        print("          → o proxy não está publicando a API (ou o Include do")
+        print("            trecho Apache não foi aplicado na borda). Ver")
+        print("            deploy/apache/evidencia-api.conf.")
+        return
+
+    if respondem and not direto.get("semantic"):
+        linha("FALHA", "a API responde, mas está sem busca", "semantic=false")
+        print("          → não alcança Qdrant ou a API de embedding; as seções")
+        print("            acima dizem qual dos dois.")
+
+    # O que nunca deveria estar na internet. Aqui "exposto" = a API respondeu
+    # JSON; 404 é a API dizendo que a rota não existe, não vazamento.
+    # (O mount /output fica de fora: sem saber o nome de um artefato real, um
+    # 404 do StaticFiles é indistinguível de "não publicado" — se as duas linhas
+    # abaixo acusarem exposição, /output está no mesmo bolo.)
+    for caminho, rotulo, nota in (
+        ("/openapi.json", "OpenAPI/Swagger (/docs, /redoc)",
+         "expõe o contrato inteiro da API, inclusive as rotas administrativas."),
+        ("/internal/gpu/status", "rotas /internal/* (GPU, artefatos)",
+         "download-url de artefatos e estado da GPU assumem estar fora da internet."),
+    ):
+        status, corpo = api_json(f"{raiz_backend}{caminho}")
+        if corpo is None or status == 404:
+            linha("OK", f"não exposto: {rotulo}")
+        else:
+            linha("FALHA", f"EXPOSTO na internet: {rotulo}", f"HTTP {status}")
+            print(f"          → {nota}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -345,6 +445,9 @@ def main() -> int:
                         help="caminho do .env (padrão: o do repositório)")
     parser.add_argument("--api-port", type=int, default=None,
                         help="porta da API local, para checar /api/search/status")
+    parser.add_argument("--public-url", default=None,
+                        help="URL pública do proxy reverso (ex.: https://devrdapp.ibict.br) — "
+                             "confere o caminho das rotas e o que vazou para a internet")
     args = parser.parse_args()
 
     print("=" * 72)
@@ -389,6 +492,8 @@ def main() -> int:
                        critico=False)
     if args.api_port:
         checa_api_local(args.api_port)
+    if args.public_url:
+        checa_api_publica(args.public_url)
 
     print("\n" + "=" * 72)
     if falhas:

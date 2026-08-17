@@ -398,6 +398,76 @@ O parâmetro é **`q`**, não `query` — com o nome errado a API devolve `[]` s
 
 Fila de falhas: `GET /api/files/failures`; reprocessar: `POST /api/files/reprocess/{job_id}`.
 
+### 8.1 Acesso pela internet (proxy da borda)
+
+Nenhuma porta do `dev-rdapp` responde da internet: o TLS de `devrdapp.ibict.br`
+termina num Apache **de outra máquina** (borda do IBICT), o mesmo que já publica o
+`dspace-angular` em `/` e o REST do DSpace em `/server`. A API entra nesse vhost como
+`/api` — trecho pronto, com instruções e rollback, em
+[`deploy/apache/evidencia-api.conf`](deploy/apache/evidencia-api.conf).
+
+Base pública: **`https://devrdapp.ibict.br/api/`** → `dev-rdapp:8020/api`.
+
+O repasse é **sem reescrita de caminho** — as rotas do backend já nascem com o
+prefixo `/api`, então `ProxyPass /api → .../api`, sem barra final nos dois lados.
+Um `ProxyPass /api/ → .../` (com barra) tira o prefixo e quebra tudo de duas formas:
+as rotas passam a exigir `/api/api/...` e a raiz do backend (`/health`, `/docs`,
+`/redoc`, `/internal/*`, `/output`) vira pública.
+
+Confira o que a borda de fato aplicou:
+
+```bash
+python3 scripts/diagnostico.py --public-url https://devrdapp.ibict.br
+```
+
+Ele diz se o prefixo está preservado e acusa `/docs` e `/internal/*` abertos na
+internet. Verificação manual equivalente:
+
+```bash
+curl -s https://devrdapp.ibict.br/api/search/status      # {"semantic":true,...}
+curl -s https://devrdapp.ibict.br/api/api/search/status  # 404 esperado
+curl -s https://devrdapp.ibict.br/api/openapi.json       # 404 esperado
+```
+
+`/health`, `/docs` e o mount `/output` ficam fora de propósito — acesse-os pela rede
+interna, em `<dev-rdapp>:8020`. As rotas `/internal/*` são administrativas e assumem
+não estar na internet: `/internal/artifacts/.../download-url` exige
+`X-Internal-Token`, mas `/internal/artifacts/health` e `/internal/gpu/*` respondem
+sem autenticação nenhuma.
+
+#### Se a borda não puder ser corrigida
+
+A borda do IBICT foi configurada com `ProxyPass /api/ → http://<host>:8020/`, que
+remove o prefixo, e a máquina é de outro time. Como remendo, o backend recoloca o
+prefixo — no `.env` do `dev-rdapp`:
+
+```ini
+PROXY_STRIPPED_PREFIX=/api      # vazio = comportamento normal (o padrão)
+PROXY_GUARD_ADMIN=true          # padrão; ver abaixo
+```
+
+`systemctl restart evidencia-api` e as rotas passam a responder em
+`https://devrdapp.ibict.br/api/files/...` sem tocar na borda. O que muda
+([`backend/api/proxy_prefix.py`](backend/api/proxy_prefix.py)):
+
+- Um request que chega em `/files/...` ou `/search/...` é reescrito para
+  `/api/...`. Os segmentos vêm das rotas registradas, não de uma lista fixa; um
+  segmento que também exista na raiz é descartado, para nunca esconder rota real.
+- `/api/...` continua valendo como sempre — a rede interna e o front do RDApp/UFT
+  não notam diferença.
+- **A guarda (`PROXY_GUARD_ADMIN`) é a parte que importa para segurança.** Recolocar
+  o prefixo não desfaz o outro efeito do strip: `/docs`, `/redoc`, `/openapi.json`,
+  `/internal/*` e `/output` continuariam publicados sob `/api/`. Com a guarda ligada,
+  essas rotas devolvem 404 para quem chega pela borda (detectado pelo
+  `X-Forwarded-For`, que o `mod_proxy` sempre acrescenta e o cliente não consegue
+  suprimir); quem fala direto com a porta 8020 segue com acesso total. `/health`
+  fica de fora de propósito: serve de health check ao proxy e não revela nada.
+
+É remendo, não desfecho: mantém uma reescrita de caminho invisível no meio do
+caminho de todo request. Quando a borda for corrigida, apague as duas variáveis e
+reinicie — o `diagnostico.py --public-url` avisa enquanto elas estiverem
+compensando a borda.
+
 ---
 
 ## 9. Operação
