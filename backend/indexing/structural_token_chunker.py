@@ -153,24 +153,30 @@ class StructuralTokenChunker:
         return self.tokens.count(text)
 
     # -- fronteiras de estado do bloco (§5/§6/§15) --------------------------
-    def _should_chunk(self, b: DocumentBlock) -> bool:
-        """Decide se um bloco entra no chunking. Default v1: só exclui furniture.
+    def _skip_reason(self, b: DocumentBlock) -> Optional[str]:
+        """Motivo pelo qual o bloco NÃO entra no chunking, ou None se ele entra.
 
-        v2 (via config): pula pré-textuais/navegação (front_matter_mode=metadata_only)
-        e referências (references_mode exclude|metadata_only)."""
+        Default v1: só exclui furniture. v2 (via config): pula pré-textuais/navegação
+        (front_matter_mode=metadata_only) e referências (references_mode
+        exclude|metadata_only). O motivo alimenta `skipped_by_reason` no relatório —
+        sem isso um documento pulado por inteiro sai como 0 chunks e 0 rejeições, sem
+        nenhuma pista do porquê."""
         if not b.chunkable:
-            return False
+            return "not_chunkable"
         if (self.cfg.front_matter_mode == "metadata_only"
                 and b.section_kind in _FRONT_MATTER_SKIP_KINDS):
-            return False
+            return f"section_kind:{b.section_kind}"
         if b.block_type == BLOCK_REFERENCE and self.cfg.references_mode in ("exclude", "metadata_only"):
-            return False
+            return "references_mode"
         # §9: equação inline suspeita (ordinal/símbolo mal lido) fora do embedding.
         if (b.block_type == BLOCK_FORMULA and self.cfg.equation_mode == "merge_with_context"
                 and b.equation_confidence is not None
                 and b.equation_confidence < self.cfg.equation_min_confidence):
-            return False
-        return True
+            return "equation_low_confidence"
+        return None
+
+    def _should_chunk(self, b: DocumentBlock) -> bool:
+        return self._skip_reason(b) is None
 
     # ------------------------------------------------------------------ API
     def chunk(
@@ -254,7 +260,12 @@ class StructuralTokenChunker:
 
             # v2: pula blocos não-chunkáveis (furniture §6) e pré-textuais/navegação
             # quando front_matter_mode=metadata_only (§5). Refs tratadas abaixo.
-            if not self._should_chunk(b):
+            skip = self._skip_reason(b)
+            if skip is not None:
+                self._metrics.skipped_blocks += 1
+                self._metrics.skipped_by_reason[skip] = (
+                    self._metrics.skipped_by_reason.get(skip, 0) + 1
+                )
                 continue
 
             # Blocos standalone (não se misturam ao grupo de parágrafos).

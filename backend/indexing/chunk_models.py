@@ -247,9 +247,12 @@ class ChunkingMetrics(BaseModel):
     removed_page_number_blocks: int = 0
     cross_page_merges: int = 0
     rejected_chunks: int = 0
+    # Blocos que nem chegaram a virar rascunho de chunk (política de seção/refs/furniture).
+    skipped_blocks: int = 0
 
     blocks_by_type: dict[str, int] = Field(default_factory=dict)
     rejected_by_reason: dict[str, int] = Field(default_factory=dict)
+    skipped_by_reason: dict[str, int] = Field(default_factory=dict)
 
     parse_time_s: float = 0.0
     tokenize_time_s: float = 0.0
@@ -297,8 +300,10 @@ class ChunkingResult(BaseModel):
             "removed_page_number_blocks": m.removed_page_number_blocks,
             "cross_page_merges": m.cross_page_merges,
             "rejected_chunks": m.rejected_chunks,
+            "skipped_blocks": m.skipped_blocks,
             "blocks_by_type": m.blocks_by_type,
             "rejected_by_reason": m.rejected_by_reason,
+            "skipped_by_reason": m.skipped_by_reason,
             "parse_time_s": round(m.parse_time_s, 3),
             "tokenize_time_s": round(m.tokenize_time_s, 3),
             "grouping_time_s": round(m.grouping_time_s, 3),

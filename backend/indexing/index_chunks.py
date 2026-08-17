@@ -567,6 +567,7 @@ def _index_structural_document(
     )
     result.metrics.parse_time_s = parse_time_s
     result.metrics.cross_page_merges = getattr(parser, "cross_page_merges", 0)
+    result.metrics.warnings.extend(getattr(parser, "warnings", []) or [])
     chunk_time_s = time.perf_counter() - t_chunk
     chunks = result.chunks
     log.info("[index] '%s': %d chunk(s) (%s) em %.3fs.", doc_id, len(chunks), strategy, chunk_time_s)
@@ -586,6 +587,14 @@ def _index_structural_document(
         chunking_report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if not chunks:
+        # Documento com blocos mas sem chunk é ANOMALIA (política de seção/filtros comeu
+        # tudo), não um PDF vazio — loga o porquê para não sair 0 chunk em silêncio.
+        if result.metrics.document_block_count:
+            log.error(
+                "[index] '%s': %d bloco(s) e NENHUM chunk — pulados=%s, rejeitados=%s.",
+                doc_id, result.metrics.document_block_count,
+                result.metrics.skipped_by_reason or {}, result.metrics.rejected_by_reason or {},
+            )
         log.warning("[index] nenhum chunk gerado para '%s'.", doc_id)
         return {
             "doc_id": doc_id, "timestamp": ts_inicio, "n_chunks": 0, "total_chars": 0,

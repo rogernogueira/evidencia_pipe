@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from backend.core.logger import log
 from backend.indexing.chunk_models import (
     BLOCK_FIGURE_CAPTION,
     BLOCK_FOOTER,
@@ -43,8 +44,12 @@ from backend.indexing.chunk_models import (
     BLOCK_REFERENCE,
     BLOCK_TABLE,
     BLOCK_UNKNOWN,
+    FRONT_MATTER_SECTION_KINDS,
+    NAVIGATION_SECTION_KINDS,
     SECTION_ACRONYM_LIST,
     SECTION_BIBLIOGRAPHY,
+    SECTION_BODY,
+    SECTION_FRONT_MATTER,
     DocumentBlock,
     DocumentStructureParseError,
 )
@@ -57,6 +62,9 @@ from backend.indexing.visual_validation import (
     image_is_indexable,
     mermaid_to_text,
 )
+
+# §4: seções que NÃO são corpo — se o documento inteiro couber aqui, ele não tem corpo.
+_FRONT_MATTER_OR_NAVIGATION = FRONT_MATTER_SECTION_KINDS | NAVIGATION_SECTION_KINDS
 
 # Header/footer é considerado "repetido" quando o MESMO texto normalizado aparece
 # em pelo menos este número de páginas (ou fração das páginas, o que for menor).
@@ -160,6 +168,9 @@ class MinerUDocumentParser:
         self.cross_page_merges = 0
         self.document_title: Optional[str] = None
         self.warnings: list[str] = []
+        # §4: documento inteiro caiu em front matter e foi promovido a corpo (rede de
+        # segurança contra o doc que sai do parse sem nenhum bloco chunkável).
+        self.front_matter_promoted_blocks = 0
         # Dicionário de siglas (§5) — expansão de consulta; NÃO gera chunks.
         self.acronyms: dict[str, str] = {}
 
@@ -574,6 +585,30 @@ class MinerUDocumentParser:
 
             section_path = [t for _, t in stack]
             blocks.append(self._mk_block(order_index, effective_type, text, b, section_path, kind))
+        return self._promote_front_matter_only_document(blocks)
+
+    def _promote_front_matter_only_document(self, blocks: list[DocumentBlock]) -> list[DocumentBlock]:
+        """Rede de segurança (§4): se NENHUM bloco saiu do front matter/navegação, o
+        documento não tem corpo — e com `front_matter_mode=metadata_only` renderia ZERO
+        chunks. Acontece quando não há título nenhum ou quando os títulos não são
+        numerados nem reconhecíveis como abertura de corpo. Nesse caso o recorte
+        pré-textual perde sentido: promove os blocos `front_matter` a `body` (a
+        navegação — sumário/listas/siglas — continua fora do corpo)."""
+        if not blocks:
+            return blocks
+        if any(b.section_kind not in _FRONT_MATTER_OR_NAVIGATION for b in blocks):
+            return blocks
+        promoted = 0
+        for b in blocks:
+            if b.section_kind == SECTION_FRONT_MATTER:
+                b.section_kind = SECTION_BODY
+                promoted += 1
+        if promoted:
+            self.front_matter_promoted_blocks = promoted
+            msg = (f"documento sem seção de corpo detectada: {promoted} bloco(s) "
+                   "front_matter promovidos a body")
+            self.warnings.append(msg)
+            log.warning("[parse] %s.", msg)
         return blocks
 
     def _collect_acronyms(self, text: str) -> None:

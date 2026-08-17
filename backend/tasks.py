@@ -174,15 +174,23 @@ def indexar_qdrant(self, ctx):
     set_status(ctx.job_id, "processando", stage="index", **_status_extra(ctx))
     try:
         summary = stages.stage_index(ctx, task_id=self.request.id)
+        # Índice vazio com blocos estruturais não é sucesso: vai para a fila de falhas
+        # (com index_error) para aparecer em /failures e poder ser reprocessado.
+        empty = summary.get("status") == "empty"
         set_status(
             ctx.job_id, "concluido", stage="index",
             n_chunks=summary.get("chunk_count"),
             indexed_count=summary.get("indexed_count"),
-            index_error=None,  # limpa erro de índice de uma tentativa anterior (reprocess)
+            # limpa erro de índice de uma tentativa anterior (reprocess)
+            index_error=summary.get("index_warning") if empty else None,
             **_status_extra(ctx),
         )
-        clear_failed(ctx.job_id)  # indexou com sucesso → sai da fila de falhas
-        log.info("Pipeline concluído para %s.", ctx.job_id)
+        if empty:
+            log.error("Indexação vazia para %s: %s", ctx.job_id, summary.get("index_warning"))
+            add_failed(ctx.job_id)
+        else:
+            clear_failed(ctx.job_id)  # indexou com sucesso → sai da fila de falhas
+            log.info("Pipeline concluído para %s.", ctx.job_id)
         return _finalize(summary)
     except Exception as exc:
         log.error("Indexação falhou para %s: %s", ctx.job_id, exc)

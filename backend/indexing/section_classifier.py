@@ -50,6 +50,24 @@ _ACRONYM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Títulos SEM numeração que abrem o corpo do documento (§4). Sem isso, um documento
+# cujos títulos não são numerados (nota técnica, artigo, parecer) ficaria inteiro em
+# `front_matter` e — com CHUNK_FRONT_MATTER_MODE=metadata_only — produziria 0 chunks.
+# NÃO inclui pré-textuais que também são "conteúdo" (resumo/abstract/agradecimentos):
+# esses continuam em front matter.
+_BODY_START_RE = re.compile(
+    r"^\s*(?:\d+\s*[-–—.]\s*)?("
+    r"introdu[çc][ãa]o|introduction|"
+    r"apresenta[çc][ãa]o|contextualiza[çc][ãa]o|contexto|justificativa|"
+    r"objetivos?|metodologia|materiais\s+e\s+m[ée]todos|m[ée]todos?|"
+    r"desenvolvimento|diagn[óo]stico|an[áa]lise|resultados?|discuss[ãa]o|"
+    r"referencial\s+te[óo]rico|fundamenta[çc][ãa]o\s+te[óo]rica|"
+    r"revis[ãa]o\s+(de\s+literatura|bibliogr[áa]fica)|"
+    r"considera[çc][õo]es\s+finais|conclus[ãa]o|conclus[õo]es|recomenda[çc][õo]es"
+    r")\b",
+    re.IGNORECASE,
+)
+
 # Palavras que caracterizam um apêndice ADMINISTRATIVO (§16). Sem elas, o apêndice é
 # tratado como ANALÍTICO por padrão (busca com peso menor).
 _ADMIN_APPENDIX_KEYWORDS = re.compile(
@@ -79,6 +97,11 @@ def infer_heading_level(text: str, fallback_level: Optional[int]) -> int:
 
 def _is_numbered(text: str) -> bool:
     return bool(_NUMBERING_RE.match(text or ""))
+
+
+def is_body_start(text: str) -> bool:
+    """True se o título, mesmo SEM numeração, abre o corpo do documento (§4)."""
+    return bool(_BODY_START_RE.match(text or ""))
 
 
 def classify_appendix(text: str) -> str:
@@ -146,9 +169,11 @@ class SectionStateMachine:
             self.current = special
         elif special is not None:
             self.current = special                       # navegação/sumário/siglas (transiente)
-        elif _is_numbered(text):
+        elif _is_numbered(text) or (not self._body_started and is_body_start(text)):
             # Título numerado inicia/continua o corpo — a menos que já estejamos num
-            # apêndice (que pode ter numeração própria).
+            # apêndice (que pode ter numeração própria). Um título SEM numeração que
+            # nomeia uma seção de corpo ("Introdução", "Metodologia"…) também encerra o
+            # front matter: documentos sem numeração não podem ficar presos nele.
             if self.base not in _APPENDIX_KINDS:
                 self.base = SECTION_BODY
             self._body_started = True

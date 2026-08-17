@@ -100,6 +100,38 @@ def test_body_paragraph_before_and_after_first_numbered_heading():
     assert sm.current == SECTION_BODY                   # corpo começou
 
 
+def test_body_starts_at_unnumbered_body_heading():
+    """Bug real (nota técnica): documento SEM numeração nos títulos ficava inteiro em
+    front_matter e, com front_matter_mode=metadata_only, gerava 0 chunks."""
+    sm = SectionStateMachine()
+    _, k_titulo = sm.feed_heading("NOTA TÉCNICA", None)      # título do documento
+    _, k_intro = sm.feed_heading("Introdução", None)         # abre o corpo (sem número)
+    _, k_depois = sm.feed_heading("Evolução da população no Distrito Federal", None)
+    assert k_titulo == SECTION_FRONT_MATTER
+    assert k_intro == SECTION_BODY
+    assert k_depois == SECTION_BODY                          # o corpo não volta a front matter
+
+
+@pytest.mark.parametrize("titulo", [
+    "Introdução", "Metodologia", "Considerações finais", "Conclusão",
+    "Resultados", "Análise dos dados", "Recomendações", "Contexto",
+])
+def test_unnumbered_body_headings_recognized(titulo):
+    sm = SectionStateMachine()
+    sm.feed_heading("Título do documento", None)
+    _, kind = sm.feed_heading(titulo, None)
+    assert kind == SECTION_BODY
+
+
+@pytest.mark.parametrize("titulo", [
+    "Relatório de Avaliação", "Coordenadores", "Agradecimentos", "Resumo",
+])
+def test_front_matter_headings_do_not_start_body(titulo):
+    sm = SectionStateMachine()
+    _, kind = sm.feed_heading(titulo, None)
+    assert kind == SECTION_FRONT_MATTER
+
+
 def test_classify_appendix_administrative_by_keyword():
     assert classify_appendix("Apêndice B – Formulário de entrevista") == SECTION_ADMINISTRATIVE_APPENDIX
     assert classify_appendix("Apêndice C – Roteiro de aplicação") == SECTION_ADMINISTRATIVE_APPENDIX
@@ -238,6 +270,63 @@ def test_parser_assigns_section_kind_and_acronyms():
     intro = next(b for b in blocks if "introdutório" in b.text)
     assert intro.section_kind == SECTION_BODY
     assert parser.acronyms.get("IRPF") == "Imposto de Renda de Pessoa Física"
+
+
+def test_parser_promotes_document_without_body_section():
+    """Rede de segurança: sem NENHUM título (ou só títulos pré-textuais), o documento
+    inteiro cairia em front_matter — e sairia do pipeline com 0 chunks."""
+    data = [_page(
+        _para("Primeiro parágrafo de um documento sem nenhum título detectado."),
+        _para("Segundo parágrafo, também conteúdo real do documento."),
+    )]
+    parser = MinerUDocumentParser()
+    blocks, _ = parser.parse_json(data)
+    assert [b.section_kind for b in blocks] == [SECTION_BODY, SECTION_BODY]
+    assert parser.front_matter_promoted_blocks == 2
+    assert parser.warnings
+
+
+def test_parser_does_not_promote_when_body_exists():
+    data = [_page(
+        _title("Capa do documento"),
+        _para("Texto pré-textual da capa."),
+        _title("1 Introdução"),
+        _para("Parágrafo do corpo do documento com conteúdo analítico."),
+    )]
+    parser = MinerUDocumentParser()
+    blocks, _ = parser.parse_json(data)
+    capa = next(b for b in blocks if "pré-textual" in b.text)
+    assert capa.section_kind == SECTION_FRONT_MATTER      # front matter preservado
+    assert parser.front_matter_promoted_blocks == 0
+
+
+def test_nota_tecnica_sem_numeracao_gera_chunks_em_metadata_only():
+    """Regressão ponta a ponta do job real: parse + chunking com os modos do .env
+    (front_matter_mode=metadata_only) tem de produzir chunks."""
+    corpo = ("A população do Distrito Federal cresceu de forma desigual entre as regiões "
+             "administrativas, com destaque para o eixo leste no período recente. ")
+    data = [
+        _page(_title("NOTA TÉCNICA", level=2), _para("Ana Maria Nogales")),
+        _page(_title("Introdução", level=2), _para(corpo * 3)),
+        _page(_title("Evolução da população", level=2), _para(corpo * 3)),
+    ]
+    parser = MinerUDocumentParser()
+    blocks, source = parser.parse_json(data)
+    res = _chunker(front_matter_mode="metadata_only", references_mode="metadata_only").chunk(
+        blocks, document_id="nota", structure_source=source
+    )
+    assert res.chunks, "documento sem numeração não pode sair com 0 chunks"
+    assert {c.section_kind for c in res.chunks} == {SECTION_BODY}
+
+
+def test_metrics_report_skipped_blocks_reason():
+    """0 chunks nunca pode sair sem pista: o relatório diz QUANTOS e POR QUÊ."""
+    blocks = [_block("Texto pré-textual da capa do documento.", 0, ["Capa"], SECTION_FRONT_MATTER)]
+    res = _chunker(front_matter_mode="metadata_only").chunk(blocks, document_id="d")
+    report = res.report()
+    assert res.chunks == []
+    assert report["skipped_blocks"] == 1
+    assert report["skipped_by_reason"] == {f"section_kind:{SECTION_FRONT_MATTER}": 1}
 
 
 def test_parser_marks_raw_text():

@@ -482,6 +482,19 @@ def stage_index(ctx: PipelineContext, *, task_id: str | None = None) -> dict:
 
     n_chunks = int(result.get("n_chunks", 0)) if isinstance(result, dict) else 0
     chunking_report = result.get("chunking_report", {}) if isinstance(result, dict) else {}
+    # 0 chunks COM blocos estruturais é anomalia (a política de seção/filtros descartou o
+    # documento inteiro): registra no manifesto e devolve status próprio, para o job não
+    # sair como sucesso silencioso com o índice vazio.
+    block_count = int(chunking_report.get("document_block_count", 0) or 0)
+    empty_index = n_chunks == 0 and block_count > 0
+    empty_reason = ""
+    if empty_index:
+        empty_reason = (
+            f"indexação vazia: {block_count} bloco(s) estruturais e 0 chunk(s) — "
+            f"pulados={chunking_report.get('skipped_by_reason') or {}} "
+            f"rejeitados={chunking_report.get('rejected_by_reason') or {}}"
+        )
+        log.error("[index] '%s': %s", document_id, empty_reason)
     with repo.update(pipeline_id, document_id) as m:
         if chunks_ref is not None:
             m.artifacts[ART_CHUNKS] = chunks_ref
@@ -493,11 +506,17 @@ def stage_index(ctx: PipelineContext, *, task_id: str | None = None) -> dict:
         m.metrics["chunking_config_hash"] = result.get("chunking_config_hash")
         m.metrics["tokenizer_name"] = result.get("tokenizer_name")
         m.metrics["structure_source"] = chunking_report.get("structure_source")
+        if empty_index:
+            m.warnings.append(empty_reason)
         st = m.stage(STAGE_INDEXING)
         st.status = "COMPLETED"
         st.completed_at = _now()
         m.status = "COMPLETED"
 
+    if empty_index:
+        summary = _summary("empty", n_chunks, n_chunks)
+        summary["index_warning"] = empty_reason
+        return summary
     return _summary("completed", n_chunks, n_chunks)
 
 
