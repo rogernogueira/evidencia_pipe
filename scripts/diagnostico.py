@@ -487,7 +487,7 @@ def main() -> int:
                        "/health", "sem MinerU não há extração; a busca no que já foi "
                                 "indexado continua funcionando.")
     checa_minio(env)
-    checa_http_simples("DSpace", cfg(env, "DSPACE_URL", "https://rdapp.comais.uft.edu.br"),
+    checa_http_simples("DSpace", cfg(env, "DSPACE_URL", "https://devrdapp.ibict.br"),
                        "/server/api", "sem DSpace não há ingestão de novos itens.",
                        critico=False)
     if args.api_port:

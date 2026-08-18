@@ -64,7 +64,9 @@ MINERU_LANG = os.getenv("MINERU_LANG", "latin").strip()
 
 # Repositório DSpace (RDApp) — estágio 1. Bitstreams são baixados de
 # {DSPACE_URL}/server/api/core/bitstreams/{uuid}/content
-DSPACE_URL = os.getenv("DSPACE_URL", "https://rdapp.comais.uft.edu.br")
+# Barra final é removida: o caminho é concatenado direto em dspace_service.py, e
+# "https://host//server/api" faz o DSpace devolver 404.
+DSPACE_URL = os.getenv("DSPACE_URL", "https://devrdapp.ibict.br").strip().rstrip("/")
 
 # --------------------------------------------------------------------------
 # Item ainda NÃO disponível no DSpace (em submissão/workflow, embargo, ou o
