@@ -474,3 +474,33 @@ MANIFEST_LOCK_TTL_SECONDS = int(os.getenv("MANIFEST_LOCK_TTL_SECONDS", "30"))
 # Token opcional para os endpoints internos (presigned URL). Se vazio, o endpoint
 # fica liberado apenas em dev — em produção defina um valor forte.
 INTERNAL_API_TOKEN = os.getenv("INTERNAL_API_TOKEN", "")
+
+# --------------------------------------------------------------------------
+# Status da infraestrutura (GET /api/status) — ver backend/services/infra_status.py.
+# Só sondagens de LEITURA (a única escrita é o probe do MinIO sob _healthcheck/,
+# controlado por MINIO_HEALTHCHECK_WRITE). Os TTLs existem porque a rota é feita
+# para ser consultada com frequência: sem cache, um painel que atualiza a cada
+# segundo viraria carga permanente de broadcast Celery + listagem S3.
+# --------------------------------------------------------------------------
+# Validade do snapshot inteiro. 0 = sempre remedir (não recomendado em produção).
+STATUS_CACHE_TTL_SECONDS = float(os.getenv("STATUS_CACHE_TTL_SECONDS", "10"))
+# Timeout de cada sondagem HTTP (Qdrant, MinerU, embedding, DSpace, Flower).
+STATUS_HTTP_TIMEOUT_SECONDS = float(os.getenv("STATUS_HTTP_TIMEOUT_SECONDS", "5"))
+# Janela do broadcast de inspeção do Celery. É o piso da latência da rota: o
+# inspect SEMPRE espera a janela inteira (não há resposta que a encerre antes).
+# Curto demais e um worker ocupado não responde e aparece como ausente.
+STATUS_CELERY_TIMEOUT_SECONDS = float(os.getenv("STATUS_CELERY_TIMEOUT_SECONDS", "1.5"))
+# A contagem de artefatos é a única sondagem cujo custo cresce com o acervo (uma
+# listagem recursiva do bucket), e o número muda devagar — por isso tem cache
+# próprio, mais longo, e um teto de objetos varridos. No teto a resposta vem com
+# `truncated: true` em vez de a rota travar.
+STATUS_ARTIFACT_SCAN_TTL_SECONDS = float(os.getenv("STATUS_ARTIFACT_SCAN_TTL_SECONDS", "120"))
+STATUS_ARTIFACT_SCAN_MAX_OBJECTS = int(os.getenv("STATUS_ARTIFACT_SCAN_MAX_OBJECTS", "200000"))
+# Abaixo deste percentual livre, o disco entra como degradado (a extração
+# materializa PDF e saída do MinerU em ARTIFACT_TEMP_DIR).
+STATUS_DISK_MIN_FREE_PERCENT = float(os.getenv("STATUS_DISK_MIN_FREE_PERCENT", "10"))
+# Consultar a placa com nvidia-smi (subprocesso). Desligue em host sem GPU para
+# não pagar o custo de tentar.
+STATUS_GPU_SMI_ENABLED = _as_bool(os.getenv("STATUS_GPU_SMI_ENABLED"), True)
+# Monitor do Celery. Vazio = não checado (o pipeline não depende do Flower).
+FLOWER_URL = os.getenv("FLOWER_URL", "").strip().rstrip("/")

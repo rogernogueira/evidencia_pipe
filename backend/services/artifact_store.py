@@ -30,7 +30,7 @@ import time
 import unicodedata
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, BinaryIO, Optional, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Iterator, Optional, Protocol, runtime_checkable
 
 from backend.core import config as settings
 from backend.core.logger import log
@@ -166,6 +166,7 @@ class ArtifactStore(Protocol):
     def delete(self, object_key: str) -> bool: ...
     def delete_prefix(self, prefix: str) -> int: ...
     def list_prefix(self, prefix: str) -> list[ArtifactReference]: ...
+    def iter_prefix(self, prefix: str) -> Iterator[tuple[str, int]]: ...
     def copy(self, src_key: str, dst_key: str, *, name: str = ...) -> ArtifactReference: ...
 
     def build_uri(self, object_key: str) -> str: ...
@@ -588,6 +589,21 @@ class MinIOArtifactStore:
                 version_id=getattr(o, "version_id", None),
             ))
         return refs
+
+    def iter_prefix(self, prefix: str) -> Iterator[tuple[str, int]]:
+        """Itera (object_key, size_bytes) sob o prefixo, sem materializar a lista.
+
+        Existe para CONTAR (ver infra_status.contar_artefatos): com um acervo grande,
+        `list_prefix` construiria uma ArtifactReference por objeto — dezenas de MB de
+        objetos temporários para produzir um número. Aqui o consumidor decide quando
+        parar (teto de varredura) e nada além disso é alocado.
+
+        Diferente de `list_prefix`, NÃO faz retry: a listagem é preguiçosa e uma falha
+        no meio do gerador não é reexecutável sem repetir o que já saiu. Quem itera
+        trata a exceção (no status ela vira "contagem indisponível", não erro 500).
+        """
+        for o in self.client.list_objects(self.bucket, prefix=prefix, recursive=True):
+            yield o.object_name, int(o.size or 0)
 
     def copy(self, src_key: str, dst_key: str, *, name: str = "") -> ArtifactReference:
         from minio.commonconfig import CopySource

@@ -200,6 +200,39 @@ def _index_ids(zset: str, mem_index: dict[str, float], limit: int, caller: str) 
         return [k for k, _ in sorted(mem_index.items(), key=lambda kv: kv[1], reverse=True)][:limit]
 
 
+def index_sizes() -> dict:
+    """Tamanho dos índices de job (em execução / sucesso / falhas), sem resolver os
+    registros — ZCARD, não uma listagem. Alimenta o GET /api/status, que é consultado
+    com frequência e só precisa dos números.
+
+    `backend` diz de onde veio a contagem: "redis" (índice compartilhado entre a API e
+    os workers) ou "memoria" (fallback por-processo — números locais e incompletos; ver
+    o cabeçalho deste módulo).
+
+    Ao contrário de list_active/list_succeeded/list_failed, NÃO poda entradas órfãs:
+    um job cujo registro expirou por TTL ainda conta aqui até alguma listagem passar e
+    remover a entrada do índice. É contagem barata, não inventário exato.
+    """
+    client = _get_redis()
+    if client is not None:
+        try:
+            return {
+                "backend": "redis",
+                "active": client.zcard(_ACTIVE_ZSET),
+                "succeeded": client.zcard(_SUCCEEDED_ZSET),
+                "failed": client.zcard(_FAILED_ZSET),
+            }
+        except Exception as exc:
+            log.warning("job_store.index_sizes: falha no Redis (%s) — fallback memória.", exc)
+    with _lock:
+        return {
+            "backend": "memoria",
+            "active": len(_active),
+            "succeeded": len(_succeeded),
+            "failed": len(_failed),
+        }
+
+
 def list_failed(limit: int = 100) -> list[dict]:
     """Lista os jobs no índice de falhas (mais recentes primeiro), com o registro
     completo de cada um. Jobs cujo registro já expirou (TTL) são podados do índice."""

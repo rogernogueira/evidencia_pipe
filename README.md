@@ -101,6 +101,8 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 | `GET`  | `/api/files/succeeded` | Lista os **últimos jobs bem sucedidos** (concluídos sem `index_error`): IDs + resumo (chunks, indexados, `artifact_id`), mais recentes primeiro. |
 | `GET`  | `/api/files/failures` | Lista os jobs na **fila de falhas** (erro num estágio ou `index_error`), mais recentes primeiro. |
 | `POST` | `/api/files/reprocess/{job_id}` | Re-enfileira a chain de um job que falhou (reusa a origem; `?force=true` reprocessa do zero). Em `item:{uuid}`, reinicia a espera pelo item no DSpace. |
+| `GET`  | `/api/status` | **Estado de toda a infraestrutura** + o que o sistema consegue fazer agora. Ver abaixo. |
+| `GET`  | `/api/status/{component}` | Um componente só (`qdrant`, `minio`, `celery`, …), com o mesmo cache. |
 | `GET`  | `/internal/artifacts/{pipeline_id}/{document_id}/{artifact_name}/download-url` | URL pré-assinada curta (autorizada via `X-Internal-Token`). |
 | `GET`  | `/internal/artifacts/health` | Health check do MinIO (bucket/leitura/escrita). |
 | `GET`  | `/internal/gpu/status` | Status do recurso de GPU (dono, TTL, fila). Não expor publicamente. |
@@ -116,6 +118,53 @@ Na instalação do IBICT a API é publicada por um proxy reverso na borda:
 restritos à rede interna. Onde a borda remover o prefixo `/api`, o backend recoloca
 via `PROXY_STRIPPED_PREFIX` e barra a raiz administrativa. Detalhes, conferência e
 o remendo: [DEPLOY.md §8.1](DEPLOY.md).
+
+## Status da infraestrutura
+
+`GET /api/status` responde numa consulta se o pipeline está de pé, com uma linha por
+dependência — e o que ela mede de concreto:
+
+| Componente | O que sai |
+|------------|-----------|
+| `qdrant` | collection configurada, **quantidade de chunks**, vetores `dense`/`sparse`, dimensão/distância, estado dos segmentos |
+| `embedder` | os dois endpoints vLLM do bge-m3, **modelo servido** × `EMBED_API_MODEL`, `max_model_len`; com `?probe=true`, round-trip real (dimensão, norma, alinhamento do esparso) |
+| `mineru` | `/health` do serviço, **backend/método/idioma em uso**, tarefas na fila/processando/concluídas/falhas |
+| `minio` | bucket, leitura e escrita, **quantidade de artefatos** e bytes, documentos, execuções e divisão por etapa (`source`/`mineru`/`indexing`/`enrichment`) |
+| `redis` | os três DBs (broker, job_store, lock da GPU), **backlog por fila** do Celery, clientes e memória |
+| `celery` | **workers online**, concorrência somada, tasks ativas/reservadas, filas cobertas e **filas sem consumidor** |
+| `gpu` | lock do `gpu_resource_manager` (dono e fila) e VRAM/utilização da placa |
+| `llm_enrich` | **ligado ou não** (`enabled` = tem chave, `auto_after_index` = roda sozinho após indexar, `active` = os dois), provedor, **modelo em uso** e se o provedor realmente serve esse modelo |
+| `llm_visual` | gate de LLM do chunking de gráficos/imagens (`CHUNK_VISUAL_LLM`) |
+| `dspace` | `/server/api` respondendo JSON do REST (origem dos PDFs) |
+| `flower`, `jobs`, `disk` | monitor (se `FLOWER_URL`), índices de job (em execução/concluídos/falhas) e espaço livre onde o pipeline escreve |
+
+Além do estado por componente, a resposta traz `capabilities` — **o que o sistema
+consegue fazer agora** (`busca`, `ingestao`, `extracao`, `indexacao`,
+`enriquecimento_llm`), cada uma com os componentes que a bloqueiam — e `config`, a
+configuração que define a semântica do índice (chunking, embedding, filtros de busca).
+
+```bash
+curl -s http://127.0.0.1:8020/api/status | jq '{status, capabilities, blocking}'
+curl -s http://127.0.0.1:8020/api/status/celery          # só os workers
+curl -s 'http://127.0.0.1:8020/api/status?probe=true'    # + round-trip de embedding
+curl -s 'http://127.0.0.1:8020/api/status?artifacts=false'  # pula a contagem no MinIO
+```
+
+**Código HTTP**: 200 com o pipeline de pé (mesmo degradado), **503** quando um
+componente crítico está fora — dá para usar direto em monitoramento. O corpo é o mesmo
+JSON nos dois casos.
+
+**Nível de detalhe**: métricas (contagens, flags, nome de modelo) vão para qualquer
+consumidor; a topologia (`internal`: URLs, versões, hostnames, PIDs, caminhos) só para
+quem chama pela rede interna — sem `X-Forwarded-For`, a mesma convenção que barra a
+raiz administrativa — ou apresenta `X-Internal-Token` igual a `INTERNAL_API_TOKEN`.
+`detail_level` na resposta diz qual nível veio. As opções caras (`fresh`, `probe`)
+também são restritas ao nível completo: pela borda, a resposta sai do cache
+(`STATUS_CACHE_TTL_SECONDS`), então consultar de segundo em segundo não vira carga.
+
+Para diagnóstico **de bancada** — no servidor, sem venv, incluindo a conferência do
+proxy da borda — o complemento é `python3 scripts/diagnostico.py --public-url ...`,
+que mede as mesmas dependências com os mesmos critérios.
 
 ## Como rodar
 

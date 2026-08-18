@@ -40,6 +40,21 @@ def _e_admin(path: str) -> bool:
     return any(path == p or path.startswith(p + "/") for p in ADMIN_PATHS)
 
 
+def veio_da_borda(scope: Scope) -> bool:
+    """True se o request chegou pelo proxy reverso da borda.
+
+    O `X-Forwarded-For` é acrescentado pelo mod_proxy em todo request que ele repassa,
+    e o cliente não tem como impedir isso — então a ausência do header identifica quem
+    fala DIRETO com a porta do backend (rede interna, scripts, systemd). Um cliente
+    interno pode acrescentar o header e se fazer passar por externo, o que só reduz o
+    próprio acesso; o contrário não acontece.
+
+    É a mesma convenção usada para barrar a raiz administrativa (ver ADMIN_PATHS) e
+    para decidir o nível de detalhe do GET /api/status.
+    """
+    return any(nome == b"x-forwarded-for" for nome, _ in scope.get("headers", []))
+
+
 class StrippedPrefixMiddleware:
     """Recoloca `prefix` nos caminhos que o proxy da borda removeu.
 
@@ -63,10 +78,8 @@ class StrippedPrefixMiddleware:
 
         path: str = scope.get("path", "")
 
-        # O X-Forwarded-For é adicionado pelo mod_proxy em todo request que ele
-        # repassa, e o cliente não tem como impedir isso — ele é o sinal de
-        # "veio de fora". Quem fala direto com a porta 8020 (rede interna,
-        # scripts, systemd) não manda o header e continua com acesso total.
+        # Quem fala direto com a porta 8020 (rede interna, scripts, systemd) não é
+        # barrado — ver `veio_da_borda`.
         if self.guarda_admin and _e_admin(path) and self._veio_do_proxy(scope):
             await self._nao_encontrado(send)
             return
@@ -86,7 +99,7 @@ class StrippedPrefixMiddleware:
 
     @staticmethod
     def _veio_do_proxy(scope: Scope) -> bool:
-        return any(nome == b"x-forwarded-for" for nome, _ in scope.get("headers", []))
+        return veio_da_borda(scope)
 
     @staticmethod
     async def _nao_encontrado(send: Send) -> None:

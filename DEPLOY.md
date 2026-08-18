@@ -366,6 +366,19 @@ curl -s  http://127.0.0.1:8181/api/search/status
 
 `{"semantic": true, ...}` confirma que a API alcançou o Qdrant **e** a API de embedding.
 
+Para a conferência completa, com uma chamada, a própria API mede tudo o que o pipeline
+precisa — e chamada de dentro do servidor ela devolve também a topologia (URLs,
+versões, workers):
+
+```bash
+curl -s http://127.0.0.1:8181/api/status | jq '{status, blocking, capabilities}'
+```
+
+`status: "ok"` e `blocking: []` significam que nenhum componente crítico está fora; a
+rota responde **503** quando algum está. `capabilities` diz o que o sistema consegue
+fazer agora (busca, ingestão, extração, indexação, enriquecimento) e quem bloqueia cada
+uma. Detalhes do que cada componente reporta: [README](README.md#status-da-infraestrutura).
+
 > Na subida, a API e o worker podem logar `API de embedding indisponível` se os vLLM
 > ainda estiverem compilando. É esperado e se resolve sozinho: a sonda é informativa e
 > a reconexão é preguiçosa, sem precisar reiniciar nada.
@@ -477,6 +490,10 @@ systemctl status evidencia.target       # visão geral
 systemctl restart evidencia.target      # reinicia infra + API + workers
 journalctl -u evidencia-api -f
 docker compose logs -f vllm-bge-m3
+
+# estado da infra pela própria API (503 = componente crítico fora)
+curl -s http://127.0.0.1:8181/api/status | jq '{status, blocking, warnings}'
+curl -s 'http://127.0.0.1:8181/api/status/celery?fresh=true' | jq  # depois de mexer nos workers
 ```
 
 ⚠️ `restart evidencia.target` executa `docker compose stop`, que **derruba toda a
