@@ -22,3 +22,8 @@ qdrant_storage/
 # Área de build/scratch: versiona só o Dockerfile do MinerU, ignora o resto (logs, runs).
 tmp/*
 !tmp/Dockerfile
+
+# Sincronização DSpace → API (scripts/sincronizar_novos_itens.py)
+logs/
+estado_sincronizacao.json
+.sincronizacao.lock
