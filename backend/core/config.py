@@ -67,6 +67,38 @@ MINERU_LANG = os.getenv("MINERU_LANG", "latin").strip()
 DSPACE_URL = os.getenv("DSPACE_URL", "https://rdapp.comais.uft.edu.br")
 
 # --------------------------------------------------------------------------
+# Item ainda NÃO disponível no DSpace (em submissão/workflow, embargo, ou o
+# próprio DSpace fora do ar). Antes, POST /api/files/dspace/item/{uuid} devolvia
+# 502 na hora e o pedido se perdia; agora a ingestão é ENFILEIRADA e a resolução
+# dos PDFs é repetida com backoff pela task resolver_item_dspace (fila `download`).
+#
+# Com os padrões abaixo a janela de espera é de ~3h30 (60s, 120s, 240s, 480s,
+# 960s e depois 1800s fixos, em 12 tentativas). Esgotada, o item vai para a fila
+# de falhas (GET /api/files/failures) e pode ser reenfileirado por
+# POST /api/files/reprocess/item:{uuid}.
+# --------------------------------------------------------------------------
+DSPACE_ITEM_RETRY_MAX_ATTEMPTS = int(os.getenv("DSPACE_ITEM_RETRY_MAX_ATTEMPTS", "12"))
+DSPACE_ITEM_RETRY_DELAY_SECONDS = int(os.getenv("DSPACE_ITEM_RETRY_DELAY_SECONDS", "60"))
+DSPACE_ITEM_RETRY_BACKOFF = float(os.getenv("DSPACE_ITEM_RETRY_BACKOFF", "2"))
+# Teto do intervalo entre tentativas. DEVE ficar abaixo do visibility_timeout do
+# broker (3600s, ver celery_app.py): a task espera com o ack pendente, e um
+# intervalo maior faria o Redis reentregar a mensagem (resolução em duplicata).
+DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS = int(os.getenv("DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS", "1800"))
+# Status HTTP do DSpace tratados como "ainda não disponível" (o resto é erro
+# definitivo e continua virando 502 na hora). 404 = item ainda não existe/publicado;
+# 403 = embargo ou permissão que ainda pode ser liberada; 5xx = DSpace fora do ar.
+DSPACE_ITEM_RETRY_HTTP_STATUSES = frozenset(
+    int(c) for c in os.getenv(
+        "DSPACE_ITEM_RETRY_HTTP_STATUSES", "403,404,408,409,423,425,429,500,502,503,504"
+    ).replace(" ", "").split(",") if c
+)
+# Item que existe mas ainda não tem PDF no bundle ORIGINAL (bitstream ainda sendo
+# anexado): também é "ainda não disponível". Desligue para voltar ao 422 imediato.
+DSPACE_ITEM_RETRY_WHEN_NO_PDF = (
+    os.getenv("DSPACE_ITEM_RETRY_WHEN_NO_PDF", "true").strip().lower() in {"1", "true", "yes", "on"}
+)
+
+# --------------------------------------------------------------------------
 # Proxy reverso que REMOVE o prefixo do caminho (ver DEPLOY.md §8.1 e
 # backend/api/proxy_prefix.py). Vazio = comportamento normal, sem middleware.
 # Só preencha (com "/api") onde a borda estiver com ProxyPass reescrevendo para a

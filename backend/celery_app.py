@@ -5,6 +5,12 @@ Desenho:
         baixar_dspace → extrair_mineru → indexar_qdrant
     O enrich por LLM é DESACOPLADO: roda como follow-up opcional (enrich_after_index)
     APÓS a indexação, sem que o índice dependa dele.
+  - Na ingestão de ITEM ainda indisponível no DSpace, resolver_item_dspace vem antes
+    da chain: ele reconsulta o DSpace com countdown/backoff (fila `download`) até os
+    PDFs aparecerem. Cada espera fica retida no worker como task com ETA — nesse caso
+    o Celery incrementa o prefetch, então ela NÃO ocupa slot de concorrência nem trava
+    a fila. O que o intervalo máximo (DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS) precisa é
+    ficar abaixo do visibility_timeout abaixo, senão o Redis reentrega a mensagem.
   - Cada estágio roda numa fila própria, para separar carga:
         download / extract / llm  → worker leve (IO-bound, concorrência alta)
         gpu                        → worker dedicado (concurrency=1, dono do bge-m3)
@@ -68,6 +74,7 @@ app.conf.update(
     task_send_sent_event=True,
     # Roteamento por fila (uma por estágio).
     task_routes={
+        "backend.tasks.resolver_item_dspace": {"queue": "download"},
         "backend.tasks.baixar_dspace": {"queue": "download"},
         "backend.tasks.extrair_mineru": {"queue": "extract"},
         "backend.tasks.enrich_llm": {"queue": "llm"},

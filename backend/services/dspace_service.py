@@ -5,6 +5,7 @@ import urllib.error
 import urllib.parse
 from pathlib import Path
 
+from backend.core import config as settings
 from backend.core.config import DSPACE_URL
 from backend.core.logger import log
 
@@ -72,6 +73,28 @@ def resolve_item_pdfs(item_uuid: str) -> list[dict]:
         raise ValueError(f"Item {item_uuid} não tem nenhum PDF no bundle ORIGINAL.")
     log.info("Item %s: %d PDF(s) encontrado(s) no ORIGINAL.", item_uuid, len(pdfs))
     return pdfs
+
+
+def item_ainda_indisponivel(exc: BaseException) -> bool:
+    """True quando o erro de `resolve_item_pdfs` significa "o item ainda não está
+    disponível para download" — situação TRANSITÓRIA que merece nova tentativa em
+    vez de 502 imediato (ver DSPACE_ITEM_RETRY_* em backend/core/config.py):
+
+      - HTTPError com status na lista configurada (404 item ainda não publicado,
+        403 embargo/permissão, 5xx DSpace fora do ar, 429 throttling);
+      - URLError (DNS/conexão/timeout — a rede ou o DSpace estão fora);
+      - ValueError do bundle ORIGINAL sem PDF (bitstream ainda sendo anexado),
+        quando DSPACE_ITEM_RETRY_WHEN_NO_PDF está ligado.
+
+    Qualquer outro erro é definitivo: quem chamou deve falhar na hora.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in settings.DSPACE_ITEM_RETRY_HTTP_STATUSES
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    if isinstance(exc, ValueError):
+        return settings.DSPACE_ITEM_RETRY_WHEN_NO_PDF
+    return False
 
 
 def _filename_from_headers(headers, uuid: str) -> str:

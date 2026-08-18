@@ -18,6 +18,36 @@ Cada estágio tem uma fila própria. A API só **enfileira** (responde `202` na 
 os **workers** executam. O status por-documento vive no `job_store` (Redis DB 1) e é
 consultado em `GET /api/files/status/{job_id}`. O **Flower** monitora a infra.
 
+## Item ainda indisponível no DSpace: espera na fila, não 502
+
+Na ingestão de **item** (`POST /api/files/dspace/item/{uuid}`) pode não haver PDF
+algum para enfileirar ainda — item em submissão/workflow, sob embargo, ou DSpace fora
+do ar. Antes a API respondia `502` e o pedido se perdia; hoje ela enfileira um
+**estágio 0** na fila `download`:
+
+```
+resolver_item_dspace  ⟳ (backoff)  →  baixar_dspace → extrair_mineru → indexar_qdrant
+```
+
+`resolver_item_dspace` reconsulta o DSpace e, enquanto o item não aparece, **reagenda
+a si mesmo** com backoff exponencial (`DSPACE_ITEM_RETRY_*`: 60s, 120s, 240s, 480s,
+960s, depois 1800s fixos — 12 tentativas, ~3h30 no total). Quando os PDFs aparecem,
+ele dispara uma chain por PDF, exatamente como o caminho síncrono.
+
+- A resposta é `202` com `status="aguardando_dspace"`; a espera é acompanhada pelo
+  registro **`item:{uuid}`** no `job_store` (`GET /api/files/status/item:{uuid}` e
+  `GET /api/files/active`, com `stage=aguardando_dspace`).
+- Esgotadas as tentativas, o registro vira `erro` e entra em `GET /api/files/failures`;
+  `POST /api/files/reprocess/item:{uuid}` reinicia a espera (primeira tentativa imediata).
+- Repetir o `POST` do mesmo item **não** duplica a espera (nem, depois, as chains) —
+  só `?force=true` reenfileira.
+- Erro **definitivo** do DSpace (ex.: `401`) continua virando `502` na hora. A lista de
+  status considerados transitórios é `DSPACE_ITEM_RETRY_HTTP_STATUSES`.
+- A espera fica no worker como task com **ETA**: nesse caso o Celery incrementa o
+  prefetch, então ela não ocupa slot de concorrência nem trava a fila `download`. Por
+  isso `DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS` (1800s) precisa ficar **abaixo** do
+  `visibility_timeout` do broker (3600s) — acima dele o Redis reentregaria a mensagem.
+
 ## Transporte da chain: só referências, nunca conteúdo
 
 A chain transporta **apenas um `PipelineContext` leve** (identificadores + a URI do

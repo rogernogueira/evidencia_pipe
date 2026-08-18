@@ -1,6 +1,10 @@
 """Tasks Celery do pipeline de ingestão (v2 — artefatos no MinIO).
 
 Chain OBRIGATÓRIA por PDF: baixar_dspace → extrair_mineru → indexar_qdrant.
+Antes dela, só na ingestão de ITEM, pode haver um estágio 0 (resolver_item_dspace):
+quando o item ainda não está disponível no DSpace, a API não devolve mais 502 — ela
+enfileira essa task, que reconsulta o DSpace com backoff até os PDFs aparecerem e só
+então dispara uma chain por PDF.
 O enriquecimento por LLM é DESACOPLADO: NÃO faz parte da chain obrigatória. Ele roda
 como follow-up OPCIONAL (enrich_after_index) disparado APÓS a indexação — ou sob
 demanda pelo endpoint /api/files/enrich/{job_id} — e propaga os metadados ao Qdrant
@@ -16,6 +20,8 @@ Antes de retornar, cada task valida o payload de saída (tamanho + chaves proibi
 via validate_chain_payload_size — barreira anti-regressão (§26/§27).
 
 Semântica de erro (fiel ao pipeline original):
+  - item indisponível       → espera na fila (backoff) e, esgotadas as tentativas,
+                              status "erro" no registro `item:{uuid}`.
   - download/mineru falham  → status "erro" e a chain para.
   - index falha             → status "concluido" + index_error (o markdown já é válido).
   - enrich (fora da chain)  → best-effort: nunca altera o status já "concluido".
@@ -28,7 +34,9 @@ from backend.celery_app import app
 from backend.core import config as settings
 from backend.core.logger import log
 from backend.core.schemas import CTX_STAGE_INDEXED, PipelineContext, validate_chain_payload_size
+from backend.services import ingest_service as ingest
 from backend.services import pipeline_stages as stages
+from backend.services.dspace_service import item_ainda_indisponivel, resolve_item_pdfs
 from backend.services.job_store import add_failed, clear_failed, set_status
 
 
@@ -78,6 +86,58 @@ class PipelineTask(app.Task):
             stage = self.name.rsplit(".", 1)[-1]
             set_status(job_id, "erro", stage=stage, error=f"{type(exc).__name__}: {exc}")
             add_failed(job_id)  # entra na fila de falhas (reprocessável)
+
+
+# --------------------------------------------------------------------------
+# Estágio 0 (só na ingestão de ITEM) — resolver os PDFs no DSpace (fila: download)
+#
+# Existe para o caso em que o item AINDA não está disponível para download (em
+# submissão/workflow, embargo, DSpace fora do ar). Antes disso a API respondia 502 e
+# o pedido se perdia; agora ela enfileira esta task, que tenta de novo com backoff
+# (DSPACE_ITEM_RETRY_*) e só desiste ao esgotar as tentativas — aí o item vai para a
+# fila de falhas. Cada tentativa é uma task nova (kwarg `attempt`), e não um retry do
+# Celery, para o mesmo caminho servir à API e ao worker.
+# --------------------------------------------------------------------------
+@app.task(bind=True)
+def resolver_item_dspace(self, item_uuid, force=False, attempt=1):
+    key = ingest.item_job_key(item_uuid)
+    set_status(
+        key, "processando", stage=ingest.PENDING_STAGE, source=ingest.PENDING_SOURCE,
+        item_uuid=item_uuid, force=force, attempt=attempt,
+        max_attempts=settings.DSPACE_ITEM_RETRY_MAX_ATTEMPTS,
+    )
+    try:
+        pdfs = resolve_item_pdfs(item_uuid)
+    except Exception as exc:
+        esgotou = attempt >= settings.DSPACE_ITEM_RETRY_MAX_ATTEMPTS
+        if item_ainda_indisponivel(exc) and not esgotou:
+            espera = ingest.schedule_item_resolution(
+                item_uuid, force=force, attempt=attempt, error=f"{type(exc).__name__}: {exc}"
+            )
+            return {"item_uuid": item_uuid, "status": ingest.PENDING_STAGE, **espera}
+
+        motivo = ("indisponível no DSpace após "
+                  f"{attempt} tentativa(s)" if item_ainda_indisponivel(exc) else "erro definitivo")
+        log.error("[dspace item] desistindo de %s (%s): %s", item_uuid, motivo, exc)
+        set_status(
+            key, "erro", stage=ingest.PENDING_STAGE, item_uuid=item_uuid, attempt=attempt,
+            error=f"Item {motivo} — {type(exc).__name__}: {exc}",
+            next_retry_at=None, next_retry_in_seconds=None,
+        )
+        add_failed(key)  # reenfileirável por POST /api/files/reprocess/item:{uuid}
+        raise
+
+    jobs = ingest.enqueue_item_pdfs(item_uuid, pdfs, force)
+    set_status(
+        key, ingest.RESOLVED_STATUS, stage=ingest.PENDING_STAGE, item_uuid=item_uuid,
+        attempt=attempt, n_pdfs=len(jobs), job_ids=[j["job_id"] for j in jobs],
+        error=None, last_error=None, next_retry_at=None, next_retry_in_seconds=None,
+    )
+    clear_failed(key)
+    log.info("[dspace item] %s disponível na tentativa %d — %d PDF(s) enfileirado(s).",
+             item_uuid, attempt, len(jobs))
+    return {"item_uuid": item_uuid, "status": "na_fila", "jobs": len(jobs),
+            "job_ids": [j["job_id"] for j in jobs]}
 
 
 # --------------------------------------------------------------------------

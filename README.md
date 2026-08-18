@@ -92,7 +92,7 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 
 | Método | Rota | Descrição |
 |--------|------|-----------|
-| `POST` | `/api/files/dspace/item/{uuid}` | **Principal** — ingere todos os PDFs de um item DSpace. `?force=true` reprocessa. |
+| `POST` | `/api/files/dspace/item/{uuid}` | **Principal** — ingere todos os PDFs de um item DSpace. `?force=true` reprocessa. Item ainda indisponível no DSpace **não** dá 502: a ingestão fica na fila e o item é reconsultado com backoff (ver [CELERY.md](CELERY.md)). |
 | `POST` | `/api/files/dspace/{uuid}` | Ingere um bitstream (PDF) específico (download roda no worker). |
 | `GET`  | `/api/files/status/{job_id}` | Status resumido do job (sem artefatos). |
 | `GET`  | `/api/files/result/{job_id}` | **Resumo** do resultado (contagens + `artifact_id`) — não devolve o conteúdo. |
@@ -100,7 +100,7 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 | `GET`  | `/api/files/active` | Lista os **jobs em execução** (`na_fila`/`processando`): IDs + resumo (estágio, arquivo, `updated_at`), mais recentes primeiro. |
 | `GET`  | `/api/files/succeeded` | Lista os **últimos jobs bem sucedidos** (concluídos sem `index_error`): IDs + resumo (chunks, indexados, `artifact_id`), mais recentes primeiro. |
 | `GET`  | `/api/files/failures` | Lista os jobs na **fila de falhas** (erro num estágio ou `index_error`), mais recentes primeiro. |
-| `POST` | `/api/files/reprocess/{job_id}` | Re-enfileira a chain de um job que falhou (reusa a origem; `?force=true` reprocessa do zero). |
+| `POST` | `/api/files/reprocess/{job_id}` | Re-enfileira a chain de um job que falhou (reusa a origem; `?force=true` reprocessa do zero). Em `item:{uuid}`, reinicia a espera pelo item no DSpace. |
 | `GET`  | `/internal/artifacts/{pipeline_id}/{document_id}/{artifact_name}/download-url` | URL pré-assinada curta (autorizada via `X-Internal-Token`). |
 | `GET`  | `/internal/artifacts/health` | Health check do MinIO (bucket/leitura/escrita). |
 | `GET`  | `/internal/gpu/status` | Status do recurso de GPU (dono, TTL, fila). Não expor publicamente. |
@@ -161,6 +161,12 @@ curl -X POST http://127.0.0.1:8020/api/files/dspace/item/<ITEM_UUID>
 
 Resposta `202` com a lista de jobs criados (um por PDF). Acompanhe cada um em
 `/api/files/status/{job_id}` e recupere o markdown em `/api/files/result/{job_id}`.
+
+Se o item **ainda não estiver disponível** no DSpace (em submissão/workflow, embargo,
+DSpace fora do ar), a resposta continua `202` — agora com `status="aguardando_dspace"`
+e `jobs: []`: a ingestão fica na fila e o item é reconsultado com backoff até os PDFs
+aparecerem. Acompanhe a espera em `/api/files/status/item:<ITEM_UUID>`. Detalhes e
+variáveis em [CELERY.md](CELERY.md).
 
 ## Requisitos externos
 

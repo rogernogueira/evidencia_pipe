@@ -14,100 +14,65 @@ Também pode ser disparado sob demanda em POST /api/files/enrich/{job_id}.
 A API só ENFILEIRA (responde 202); os workers executam. A chain transporta apenas
 um PipelineContext leve; o conteúdo vive no MinIO e é descoberto pelo manifesto.
 
+Item ainda indisponível no DSpace também é caso de FILA, não de erro: em vez do 502
+que perdia o pedido, a ingestão de item enfileira resolver_item_dspace, que reconsulta
+o DSpace com backoff (DSPACE_ITEM_RETRY_*) até os PDFs aparecerem. A espera é
+acompanhada pelo registro `item:{uuid}` no job_store (ver backend/services/ingest_service.py).
+
 Os endpoints de status/resultado NÃO retornam artefatos completos — só um resumo.
 Para baixar um artefato use o endpoint interno de URL pré-assinada
 (backend/api/routes/artifacts.py).
 """
 
 import urllib.error
-from pathlib import Path
 
-from celery import chain
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from backend.core import config as settings
 from backend.core.logger import log_api
 from backend.core.schemas import (
     ART_METADATA_CANDIDATES,
     CTX_STAGE_EXTRACTED,
     PipelineContext,
 )
+from backend.services import ingest_service as ingest
 from backend.services import llm_enrich_service as llm_enrich
 from backend.services import pipeline_stages as stages
-from backend.services.dspace_service import resolve_item_pdfs
+from backend.services.dspace_service import item_ainda_indisponivel, resolve_item_pdfs
 from backend.services.job_store import (
-    clear_failed,
     get_job,
     list_active,
     list_failed,
     list_succeeded,
     set_status,
 )
-from backend.tasks import baixar_dspace, enrich_after_index, extrair_mineru, indexar_qdrant
 
 router = APIRouter()
-
-
-def _build_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force):
-    """Cadeia OBRIGATÓRIA (3 estágios) — o download roda no worker e grava no MinIO.
-    O enrich NÃO entra aqui: é anexado como follow-up opcional em _enqueue_chain."""
-    return chain(
-        baixar_dspace.s(bs_uuid, filename, job_id=job_id, item_uuid=item_uuid,
-                        item_handle=item_handle, force=force),
-        extrair_mineru.s(),
-        indexar_qdrant.s(),
-    )
-
-
-def _enqueue_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force):
-    """Enfileira a chain obrigatória e, quando o enrich está habilitado e há provedor
-    LLM configurado, anexa enrich_after_index como follow-up DESACOPLADO (link) que
-    roda APÓS a indexação — o índice nunca espera nem depende do LLM."""
-    clear_failed(job_id)  # (re)enfileirar supera uma falha anterior
-    sig = _build_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force)
-    link = None
-    if settings.LLM_ENRICH_AUTO and llm_enrich.is_available():
-        link = enrich_after_index.s()
-    sig.apply_async(link=link)
 
 
 @router.post("/api/files/dspace/item/{uuid}")
 def ingest_dspace_item(uuid: str, force: bool = Query(default=False)) -> JSONResponse:
     """Resolve os PDFs do bundle ORIGINAL de um item DSpace e enfileira uma chain
     Celery por PDF. Cada PDF vira um documento com manifesto e prefixo próprios no
-    MinIO (§31). `force=true` reprocessa ignorando artefatos existentes (§32)."""
+    MinIO (§31). `force=true` reprocessa ignorando artefatos existentes (§32).
+
+    Item ainda NÃO disponível para download (em submissão/workflow, embargo, DSpace
+    fora do ar, PDF ainda não anexado): a resposta NÃO é mais 502/422. O pedido é
+    ENFILEIRADO — a task resolver_item_dspace reconsulta o DSpace com backoff
+    (DSPACE_ITEM_RETRY_*) e dispara as chains assim que os PDFs aparecerem. A resposta
+    é 202 com `status="aguardando_dspace"`, e a espera é acompanhada em
+    `GET /api/files/status/item:{uuid}` (ou em `GET /api/files/active`). Esgotadas as
+    tentativas, o item vai para `GET /api/files/failures`. Erro definitivo do DSpace
+    (ex.: 401) continua virando 502 na hora."""
     log_api.info("Ingestão de item DSpace solicitada: uuid=%s force=%s", uuid, force)
     try:
         pdfs = resolve_item_pdfs(uuid)
-    except urllib.error.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"DSpace retornou HTTP {e.code} para o item {uuid}.")
-    except urllib.error.URLError as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao acessar o DSpace: {e.reason}")
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        if not item_ainda_indisponivel(e):
+            raise _erro_dspace_definitivo(uuid, e)
+        return _aguardar_item(uuid, force, e)
 
-    jobs = []
-    for pdf in pdfs:
-        bs_uuid = pdf["bitstream_uuid"]
-        filename = pdf["filename"]
-        item_handle = pdf.get("item_handle") or ""
-        job_id = Path(filename).stem
-
-        set_status(
-            job_id, "na_fila", filename=filename,
-            source="dspace-item", item_uuid=uuid, item_handle=item_handle, bitstream_uuid=bs_uuid,
-        )
-        _enqueue_chain(bs_uuid, filename, job_id, uuid, item_handle, force)
-
-        jobs.append({
-            "job_id": job_id,
-            "filename": filename,
-            "bitstream_uuid": bs_uuid,
-            "status_url": f"/api/files/status/{job_id}",
-            "result_url": f"/api/files/result/{job_id}",
-        })
-
+    jobs = ingest.enqueue_item_pdfs(uuid, pdfs, force)
     return JSONResponse(
         status_code=202,
         content={
@@ -115,6 +80,50 @@ def ingest_dspace_item(uuid: str, force: bool = Query(default=False)) -> JSONRes
             "item_uuid": uuid,
             "status": "na_fila",
             "jobs": jobs,
+        },
+    )
+
+
+def _erro_dspace_definitivo(uuid: str, exc: Exception) -> HTTPException:
+    """Traduz um erro NÃO transitório do DSpace na resposta de erro da API (mesma
+    semântica de antes: 502 para falha de acesso, 422 para item sem PDF)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return HTTPException(status_code=502, detail=f"DSpace retornou HTTP {exc.code} para o item {uuid}.")
+    if isinstance(exc, urllib.error.URLError):
+        return HTTPException(status_code=502, detail=f"Falha ao acessar o DSpace: {exc.reason}")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    log_api.error("Falha inesperada ao resolver o item %s: %s", uuid, exc)
+    return HTTPException(status_code=502, detail=f"Falha ao resolver o item {uuid}: {exc}")
+
+
+def _aguardar_item(uuid: str, force: bool, exc: Exception) -> JSONResponse:
+    """Item ainda indisponível: coloca a ingestão na fila (ou reaproveita a espera já
+    em andamento) e responde 202 — nunca 502."""
+    key = ingest.item_job_key(uuid)
+    motivo = f"{type(exc).__name__}: {exc}"
+    em_espera = get_job(key)
+
+    if not force and ingest.item_wait_is_alive(em_espera):
+        log_api.info("Item %s já está aguardando o DSpace — não reenfileirado.", uuid)
+        espera = ingest.item_wait_summary(em_espera)
+        mensagem = "Item ainda não disponível no DSpace — já havia uma ingestão aguardando na fila."
+    else:
+        espera = ingest.schedule_item_resolution(uuid, force=force, attempt=1, error=motivo)
+        mensagem = ("Item ainda não disponível no DSpace — ingestão enfileirada; "
+                    f"nova tentativa em {espera['next_retry_in_seconds']}s.")
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "message": mensagem,
+            "item_uuid": uuid,
+            "status": ingest.PENDING_STAGE,
+            "job_id": key,
+            "status_url": f"/api/files/status/{key}",
+            "reason": motivo,
+            "retry": espera,
+            "jobs": [],
         },
     )
 
@@ -128,7 +137,7 @@ def ingest_dspace_bitstream(uuid: str, force: bool = Query(default=False)) -> JS
     job_id = uuid
     filename = f"{uuid}.pdf"
     set_status(job_id, "na_fila", filename=filename, source="dspace", bitstream_uuid=uuid)
-    _enqueue_chain(uuid, filename, job_id, "", "", force)
+    ingest.enqueue_chain(uuid, filename, job_id, "", "", force)
 
     return JSONResponse(
         status_code=202,
@@ -310,11 +319,33 @@ def reprocess_job(job_id: str, force: bool = Query(default=True)) -> JSONRespons
     """Re-enfileira a chain de ingestão de um job que falhou, reusando a origem
     (bitstream/item) registrada no job_store. `force=true` (padrão) ignora artefatos
     existentes e reprocessa do zero; `force=false` reaproveita etapas já concluídas
-    (idempotência por manifesto/SHA — útil p.ex. para reindexar sem re-extrair)."""
+    (idempotência por manifesto/SHA — útil p.ex. para reindexar sem re-extrair).
+
+    Para o registro de um ITEM que ficou indisponível no DSpace (`item:{uuid}`, ver
+    POST /api/files/dspace/item/{uuid}) o que se reenfileira é a RESOLUÇÃO do item —
+    a contagem de tentativas recomeça e a primeira é imediata."""
     log_api.info("POST /api/files/reprocess/%s force=%s", job_id, force)
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' desconhecido.")
+
+    # Registro de ITEM que esgotou as tentativas de espera (`item:{uuid}`): não há
+    # bitstream para reprocessar — o que se reenfileira é a resolução no DSpace.
+    if ingest.is_pending_item(job):
+        item_uuid = job.get("item_uuid") or job_id.removeprefix(ingest.ITEM_KEY_PREFIX)
+        espera = ingest.schedule_item_resolution(item_uuid, force=force, attempt=1,
+                                                 error=job.get("error") or "", delay=0)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "Resolução do item reenfileirada — o DSpace será consultado de novo.",
+                "item_uuid": item_uuid,
+                "job_id": job_id,
+                "status": ingest.PENDING_STAGE,
+                "retry": espera,
+                "status_url": f"/api/files/status/{job_id}",
+            },
+        )
 
     bs_uuid = job.get("bitstream_uuid")
     if not bs_uuid:
@@ -332,7 +363,7 @@ def reprocess_job(job_id: str, force: bool = Query(default=True)) -> JSONRespons
         job_id, "na_fila", filename=filename, source=job.get("source"),
         item_uuid=item_uuid, item_handle=item_handle, bitstream_uuid=bs_uuid,
     )
-    _enqueue_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force)
+    ingest.enqueue_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force)
 
     return JSONResponse(
         status_code=202,
