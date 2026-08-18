@@ -30,10 +30,12 @@ class SearchResult(BaseModel):
     Deriva do payload gravado pelo indexador (backend/indexing/index_chunks.py):
     campos com fallback para tolerar tanto o payload legado quanto o estrutural
     (§26): section|section_title, page|page_start, content|text, type|content_type.
+
+    O resultado NÃO carrega nome, id nem caminho de arquivo (doc_name/doc_id/doc_path):
+    quem precisa apontar para o documento de origem usa `item_uuid`/`item_handle`, os
+    identificadores do DSpace. O `doc_id` continua no payload do Qdrant e segue
+    servindo de FILTRO da busca — só não volta na resposta.
     """
-    doc_name: Optional[str] = Field(None, description="Nome do arquivo markdown do documento")
-    doc_id: Optional[str] = Field(None, description="Identificador do documento (ex: 'relatorio.pdf')")
-    doc_path: Optional[str] = Field(None, description="Caminho web do markdown (sob /output)")
     section: str = Field("", description="Seção a que o chunk pertence")
     page: Optional[int] = Field(None, description="Página de origem do chunk")
     snippet: str = Field("", description="Trecho de texto do chunk (conteúdo casado)")

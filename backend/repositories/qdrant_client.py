@@ -240,9 +240,6 @@ class SemanticSearch:
         if page is None:
             page = pl.get("page_start")
         return SearchResult(
-            doc_name=pl.get("doc_name"),
-            doc_id=pl.get("doc_id"),
-            doc_path=pl.get("doc_path"),
             section=pl.get("section") or pl.get("section_title") or "",
             page=page,
             snippet=pl.get("content") or pl.get("text") or "",

@@ -59,10 +59,9 @@ def make_client(fake):
 
 
 def _sample_result():
+    """Um resultado como o SemanticSearch o devolve hoje: sem nome, id ou caminho de
+    arquivo — a identidade do documento vai nos identificadores do DSpace."""
     return SearchResult(
-        doc_name="relatorio.md",
-        doc_id="relatorio.pdf",
-        doc_path="/output/relatorio/relatorio.md",
         section="Introdução",
         page=3,
         snippet="Trecho encontrado.",
@@ -86,10 +85,40 @@ def test_semantic_happy_path_returns_results():
     assert resp.status_code == 200
     body = resp.json()
     assert isinstance(body, list) and len(body) == 1
-    assert body[0]["doc_id"] == "relatorio.pdf"
     assert body[0]["snippet"] == "Trecho encontrado."
     assert body[0]["score"] == 0.9876
+    assert body[0]["item_uuid"] == "uuid-123"
+    assert body[0]["item_handle"] == "123456789/1"
     assert fake.ensure_connected_calls == 1
+
+
+def test_resultado_traz_exatamente_os_campos_do_schema():
+    """Trava a forma do resultado.
+
+    `doc_name`, `doc_id` e `doc_path` saíram do SearchResult: a resposta não carrega
+    mais nome nem caminho de arquivo, e quem precisa apontar para o documento usa
+    `item_uuid`/`item_handle`. Um campo reintroduzido sem querer (ou um campo perdido
+    numa refatoração) quebra aqui, e não no consumidor."""
+    client = make_client(FakeSemanticSearch(results=[_sample_result()]))
+
+    resultado = client.get("/api/search/semantic", params={"q": "x"}).json()[0]
+
+    assert set(resultado) == {"section", "page", "snippet", "score", "type",
+                              "item_uuid", "item_handle"}
+
+
+def test_filtro_por_doc_id_continua_existindo_como_parametro():
+    """O `doc_id` saiu da RESPOSTA, não do índice: o payload no Qdrant continua com
+    ele e a busca continua filtrando por ele (ver SemanticSearch.search)."""
+    fake = FakeSemanticSearch(results=[_sample_result()])
+    client = make_client(fake)
+
+    resposta = client.get("/api/search/semantic",
+                          params={"q": "x", "doc_id": "relatorio.pdf"})
+
+    assert resposta.status_code == 200
+    assert fake.search_calls[0]["doc_id"] == "relatorio.pdf"
+    assert "doc_id" not in resposta.json()[0]
 
 
 def test_semantic_forwards_query_params_to_search():
