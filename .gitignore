@@ -27,3 +27,6 @@ tmp/*
 logs/
 estado_sincronizacao.json
 .sincronizacao.lock
+# Ledger do que já foi enviado (compartilhado com scripts/extrair_e_enviar_uuids.py):
+# é estado de execução, muda a cada rodada.
+itens_uuid.csv
