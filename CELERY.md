@@ -41,8 +41,12 @@ ele dispara uma chain por PDF, exatamente como o caminho síncrono.
   `POST /api/files/reprocess/item:{uuid}` reinicia a espera (primeira tentativa imediata).
 - Repetir o `POST` do mesmo item **não** duplica a espera (nem, depois, as chains) —
   só `?force=true` reenfileira.
-- Erro **definitivo** do DSpace (ex.: `401`) continua virando `502` na hora. A lista de
-  status considerados transitórios é `DSPACE_ITEM_RETRY_HTTP_STATUSES`.
+- Erro **definitivo** do DSpace (ex.: `400` de UUID malformado) continua virando `502`
+  na hora. A lista de status transitórios é `DSPACE_ITEM_RETRY_HTTP_STATUSES`, e o
+  `401` está nela: o DSpace REST responde `401` (não `403`) a qualquer requisição
+  anônima sem permissão — inclusive nos endpoints de submissão/workflow, onde o item
+  vive antes de ser publicado. Como a ingestão é anônima, `401` aqui significa "ainda
+  não liberado", não credencial errada.
 - A espera fica no worker como task com **ETA**: nesse caso o Celery incrementa o
   prefetch, então ela não ocupa slot de concorrência nem trava a fila `download`. Por
   isso `DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS` (1800s) precisa ficar **abaixo** do

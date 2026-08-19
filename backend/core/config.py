@@ -88,10 +88,17 @@ DSPACE_ITEM_RETRY_BACKOFF = float(os.getenv("DSPACE_ITEM_RETRY_BACKOFF", "2"))
 DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS = int(os.getenv("DSPACE_ITEM_RETRY_MAX_DELAY_SECONDS", "1800"))
 # Status HTTP do DSpace tratados como "ainda não disponível" (o resto é erro
 # definitivo e continua virando 502 na hora). 404 = item ainda não existe/publicado;
-# 403 = embargo ou permissão que ainda pode ser liberada; 5xx = DSpace fora do ar.
+# 401/403 = o anônimo ainda não pode ler; 5xx = DSpace fora do ar.
+#
+# O 401 está aqui de propósito: o DSpace REST responde 401 (não 403) a QUALQUER
+# requisição anônima sem permissão — inclusive `workflow/workflowitems` e
+# `submission/workspaceitems`, onde o item vive antes de ser publicado. Item em
+# submissão, sob embargo ou retirado devolve 401 ao anônimo, e isso é justamente o
+# "ainda não disponível". Como a ingestão é anônima, um 401 aqui não é problema de
+# credencial: tire-o da lista se algum dia o pipeline passar a autenticar.
 DSPACE_ITEM_RETRY_HTTP_STATUSES = frozenset(
     int(c) for c in os.getenv(
-        "DSPACE_ITEM_RETRY_HTTP_STATUSES", "403,404,408,409,423,425,429,500,502,503,504"
+        "DSPACE_ITEM_RETRY_HTTP_STATUSES", "401,403,404,408,409,423,425,429,500,502,503,504"
     ).replace(" ", "").split(",") if c
 )
 # Item que existe mas ainda não tem PDF no bundle ORIGINAL (bitstream ainda sendo

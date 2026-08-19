@@ -63,7 +63,7 @@ def ingest_dspace_item(uuid: str, force: bool = Query(default=False)) -> JSONRes
     é 202 com `status="aguardando_dspace"`, e a espera é acompanhada em
     `GET /api/files/status/item:{uuid}` (ou em `GET /api/files/active`). Esgotadas as
     tentativas, o item vai para `GET /api/files/failures`. Erro definitivo do DSpace
-    (ex.: 401) continua virando 502 na hora."""
+    (ex.: 400 de UUID malformado) continua virando 502 na hora."""
     log_api.info("Ingestão de item DSpace solicitada: uuid=%s force=%s", uuid, force)
     try:
         pdfs = resolve_item_pdfs(uuid)

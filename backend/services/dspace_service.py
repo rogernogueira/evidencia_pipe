@@ -81,7 +81,8 @@ def item_ainda_indisponivel(exc: BaseException) -> bool:
     vez de 502 imediato (ver DSPACE_ITEM_RETRY_* em backend/core/config.py):
 
       - HTTPError com status na lista configurada (404 item ainda não publicado,
-        403 embargo/permissão, 5xx DSpace fora do ar, 429 throttling);
+        401/403 item que o anônimo ainda não pode ler — em submissão/workflow,
+        embargo, retirado —, 5xx DSpace fora do ar, 429 throttling);
       - URLError (DNS/conexão/timeout — a rede ou o DSpace estão fora);
       - ValueError do bundle ORIGINAL sem PDF (bitstream ainda sendo anexado),
         quando DSPACE_ITEM_RETRY_WHEN_NO_PDF está ligado.

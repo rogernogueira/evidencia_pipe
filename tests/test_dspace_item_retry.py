@@ -86,13 +86,18 @@ def client():
 # --------------------------------------------------------------------------
 # Classificação do erro
 # --------------------------------------------------------------------------
-@pytest.mark.parametrize("code", [403, 404, 429, 500, 502, 503])
+@pytest.mark.parametrize("code", [401, 403, 404, 429, 500, 502, 503])
 def test_status_transitorio_e_indisponibilidade(code):
+    """401 entra aqui de propósito: o DSpace REST responde 401 (não 403) a requisição
+    anônima sem permissão — inclusive em workflow/workspace, onde o item fica antes de
+    ser publicado. Item em submissão, sob embargo ou retirado devolve 401 ao anônimo, e
+    a ingestão é anônima; logo é "ainda não disponível", não credencial errada."""
     assert dspace_service.item_ainda_indisponivel(http_error(code)) is True
 
 
-@pytest.mark.parametrize("code", [400, 401, 405, 410])
+@pytest.mark.parametrize("code", [400, 405, 410])
 def test_status_definitivo_nao_e_indisponibilidade(code):
+    """400 = UUID malformado, 405/410 = rota/recurso que não volta. Esperar não ajuda."""
     assert dspace_service.item_ainda_indisponivel(http_error(code)) is False
 
 
@@ -192,9 +197,22 @@ def test_force_reenfileira_a_espera(monkeypatch, client, fila):
     assert fila.resolucoes[-1][0]["force"] is True
 
 
-def test_erro_definitivo_continua_502(monkeypatch, client, fila):
+def test_item_em_submissao_401_vai_para_a_fila(monkeypatch, client, fila):
+    """Regressão do caso real: item ainda não publicado devolve 401 ao anônimo e ia
+    embora como 502 sem passar pela fila."""
     monkeypatch.setattr(files_route, "resolve_item_pdfs",
                         lambda uuid: (_ for _ in ()).throw(http_error(401)))
+
+    r = client.post(f"/api/files/dspace/item/{ITEM}")
+
+    assert r.status_code == 202
+    assert r.json()["status"] == "aguardando_dspace"
+    assert len(fila.resolucoes) == 1
+
+
+def test_erro_definitivo_continua_502(monkeypatch, client, fila):
+    monkeypatch.setattr(files_route, "resolve_item_pdfs",
+                        lambda uuid: (_ for _ in ()).throw(http_error(400)))
 
     r = client.post(f"/api/files/dspace/item/{ITEM}")
 
