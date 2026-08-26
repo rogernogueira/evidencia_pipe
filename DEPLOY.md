@@ -368,10 +368,12 @@ curl -s  http://127.0.0.1:8181/api/search/status
 
 Para a conferência completa, com uma chamada, a própria API mede tudo o que o pipeline
 precisa — e chamada de dentro do servidor ela devolve também a topologia (URLs,
-versões, workers):
+versões, workers). A rota exige Bearer de admin do DSpace (§8.2, onde está como obter
+o `$TOKEN`), inclusive de dentro do host:
 
 ```bash
-curl -s http://127.0.0.1:8181/api/status | jq '{status, blocking, capabilities}'
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8181/api/status \
+  | jq '{status, blocking, capabilities}'
 ```
 
 `status: "ok"` e `blocking: []` significam que nenhum componente crítico está fora; a
@@ -481,6 +483,114 @@ caminho de todo request. Quando a borda for corrigida, apague as duas variáveis
 reinicie — o `diagnostico.py --public-url` avisa enquanto elas estiverem
 compensando a borda.
 
+### 8.2 Autorização das rotas administrativas (quem autoriza é o DSpace)
+
+A fila de ingestão fica atrás de um `Authorization: Bearer <token do DSpace>` de
+**administrador do repositório** — o MESMO token que o `dspace-angular` já usa. Não
+há chave própria nem segredo compartilhado: um segundo universo de permissões, fora
+do DSpace, é pior que nenhum. Implementação em
+[`backend/api/auth.py`](backend/api/auth.py).
+
+| Rota | Autorização |
+|------|-------------|
+| `GET /api/files/active`, `/succeeded`, `/failures` | Bearer + admin |
+| `GET /api/files/status/{job}`, `/result/{job}` | Bearer + admin |
+| `POST /api/files/reprocess/{job}` | Bearer + admin (é escrita) |
+| `GET /api/status`, `/api/status/{component}` | Bearer + admin — descreve a infra inteira |
+| `GET /api/search/*`, `GET /health` | abertas |
+| `POST /api/files/dspace/...` (enfileiramento) | abertas — ver o aviso no fim |
+
+São duas consultas ao DSpace, e a segunda não é redundante: `/api/authn/status` diz
+**quem** é o dono do token, não **o que** ele pode. A checagem de admin usa o mesmo
+endpoint da UI do DSpace (`FeatureID.AdministratorOf`):
+`/api/authz/authorizations/search/object?uri={self href do Site}&feature=administratorOf`,
+**sem** o parâmetro `eperson`, para o backend responder sobre o dono do token —
+resultado não vazio ⇒ é admin. O `uri` do Site é resolvido uma vez, na subida, em
+`GET /api/core/sites`.
+
+Configuração (`.env`, todas opcionais):
+
+```ini
+# Quem VALIDA os tokens não é necessariamente de onde vêm os PDFs — e hoje não é.
+# DSPACE_URL (estágio 1) segue apontando para o repositório de onde os bitstreams são
+# baixados; DSPACE_SERVER_URL é usado APENAS pela validação de sessão. Vazio =
+# {DSPACE_URL}/server.
+DSPACE_URL=https://devrdapp.ibict.br                       # origem dos PDFs
+DSPACE_SERVER_URL=https://rdapp.comais.uft.edu.br/server   # valida os tokens
+ADMIN_AUTH_ENABLED=true            # false SÓ em desenvolvimento local
+ADMIN_AUTH_CACHE_TTL_SECONDS=45    # cache curto é obrigatório, ver abaixo
+ADMIN_AUTH_TIMEOUT_SECONDS=5
+```
+
+**O cache não é otimização.** A aba de Ingestão do front recarrega a cada 5 s, em até
+3 listas em paralelo: sem cache seriam ~36 consultas por minuto ao `/api/authn/status`
+por administrador com a tela aberta. A chave é o SHA-256 do token (o token nunca é
+guardado em claro, logado ou devolvido em mensagem de erro) e a entrada morre quando
+o DSpace responde 401.
+
+**O código de erro é contrato com o front**, que decide entre relogar e tentar de novo:
+
+| Código | Quando | O que o front mostra |
+|--------|--------|----------------------|
+| `401` | sem token, token inválido/expirado | "Sua sessão expirou. Entre novamente." (sem retry) |
+| `403` | token válido, mas não é admin | "Sua conta não pode ler a fila de ingestão." (sem retry) |
+| `503` | DSpace fora do ar, timeout na validação | "…pode estar reiniciando" (retry com backoff) |
+
+O ponto crítico é o 503: **falha ao validar não é 401**. Devolver 401 quando o DSpace
+está reiniciando manda o administrador relogar à toa — e o login falharia pelo mesmo
+motivo. Só o próprio DSpace produz 401 aqui.
+
+Conferência (troque o host pelo do ambiente):
+
+```bash
+API=https://api.rdapp.comais.uft.edu.br
+DSPACE=https://rdapp.comais.uft.edu.br
+
+# deve dar 401
+curl -i $API/api/files/failures
+curl -i $API/api/status
+
+# Login. O POST /authn/login EXIGE o token CSRF: sem ele o DSpace responde 403 (não
+# 401) e a mensagem não diz o motivo — conferido no devrdapp. O Bearer sai no header
+# Authorization da resposta e é de vida curta; refaça o login quando voltar a dar 401.
+COOKIES=$(mktemp)
+XSRF=$(curl -s -c "$COOKIES" -D- -o /dev/null "$DSPACE/server/api/security/csrf" \
+       | awk 'tolower($1)=="dspace-xsrf-token:"{print $2}' | tr -d '\r')
+TOKEN=$(curl -si -b "$COOKIES" -H "X-XSRF-TOKEN: $XSRF" \
+        -X POST "$DSPACE/server/api/authn/login" \
+        -d "user=admin@exemplo.edu&password=..." \
+        | awk 'tolower($1)=="authorization:"{print $3}' | tr -d '\r')
+
+# token de um admin → 200; de usuário comum → 403
+curl -i -H "Authorization: Bearer $TOKEN" $API/api/files/failures
+curl -i -H "Authorization: Bearer $TOKEN" $API/api/status
+
+# público continua aberto
+curl -i "$API/api/search/semantic?q=agua"
+curl -i $API/health
+```
+
+**CORS já está pronto para isto**: mandar `Authorization` torna a requisição
+*preflighted*, e o `OPTIONS` precisa responder o header — o middleware em
+[`backend/main.py`](backend/main.py) espelha os headers pedidos e ecoa a origem
+(com `allow_credentials=True`, porque o front chama com `withCredentials`).
+Origem nova? Acrescente em `CORS_ALLOW_ORIGINS`.
+
+**Ordem do deploy**: suba a proteção **depois** do front novo estar no ar. O front
+antigo continua funcionando por acidente (já manda o header em tudo para usuário
+logado), mas quem não for admin passa a ver 403 sem a mensagem nova.
+
+⚠️ **O que ainda está aberto — e o que vai acontecer com ele**: as rotas de
+enfileiramento (`POST /api/files/dspace/item/{uuid}`, `POST /api/files/dspace/{uuid}`)
+e o `POST /api/files/enrich/{job_id}`. As duas primeiras são chamadas pela
+sincronização periódica (`scripts/sincronizar_novos_itens.py`), que roda no próprio
+host e não tem sessão DSpace — exigir Bearer nelas derrubaria a ingestão automática.
+
+**Elas não vão ganhar Bearer: vão sair do acesso externo e ficar alcançáveis apenas
+pela rede local.** O lugar disso é a borda (não publicar esses caminhos no vhost) ou
+o firewall do host; o backend não muda. O `enrich` é a primeira candidata — cada
+chamada gasta LLM e nenhum consumidor legítimo dela vem da internet.
+
 ---
 
 ## 9. Operação
@@ -491,9 +601,15 @@ systemctl restart evidencia.target      # reinicia infra + API + workers
 journalctl -u evidencia-api -f
 docker compose logs -f vllm-bge-m3
 
-# estado da infra pela própria API (503 = componente crítico fora)
-curl -s http://127.0.0.1:8181/api/status | jq '{status, blocking, warnings}'
-curl -s 'http://127.0.0.1:8181/api/status/celery?fresh=true' | jq  # depois de mexer nos workers
+# estado da infra pela própria API (503 = componente crítico fora). Exige Bearer de
+# admin do DSpace mesmo de dentro do host — o $TOKEN sai do login em §8.2, e expira.
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8181/api/status \
+  | jq '{status, blocking, warnings}'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:8181/api/status/celery?fresh=true' | jq  # depois de mexer nos workers
+
+# sem token, o que continua respondendo é o liveness:
+curl -s http://127.0.0.1:8181/health
 ```
 
 ⚠️ `restart evidencia.target` executa `docker compose stop`, que **derruba toda a

@@ -42,6 +42,13 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # pragma: no cover - a sonda é best-effort
         log.warning("Falha ao sondar a API de embedding (seguindo): %s", exc)
 
+    # Resolve o Site do DSpace usado na checagem de administrador das rotas de
+    # ingestão (backend/api/auth.py). Best-effort: se o DSpace estiver fora, a
+    # resolução acontece na primeira requisição administrativa.
+    from backend.api.auth import preload_site_self_href
+
+    await preload_site_self_href()
+
     log.info("=== Servidor pronto (porta %d) ===", APP_PORT)
     yield
     log.info("=== evidencia_pipe encerrando ===")

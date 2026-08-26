@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
+from backend.api.auth import dspace_admin  # noqa: E402
 from backend.api.routes import files as files_route  # noqa: E402
 from backend.core import config as settings  # noqa: E402
 from backend.services import dspace_service, ingest_service as ingest  # noqa: E402
@@ -80,6 +81,10 @@ def fila(monkeypatch):
 def client():
     app = FastAPI()
     app.include_router(files_route.router)
+    # POST /api/files/reprocess exige admin do DSpace (backend/api/auth.py); aqui o
+    # assunto é a espera pelo item, então a autorização é dispensada. Quem a testa é
+    # tests/test_admin_auth.py.
+    app.dependency_overrides[dspace_admin] = lambda: {"eperson": None}
     return TestClient(app)
 
 

@@ -92,6 +92,7 @@ def test_limit_is_respected(js):
 
 
 def test_route_lists_ids_and_summary(js):
+    from backend.api.auth import dspace_admin
     from backend.api.routes import files as files_route
 
     _run_ok(js, "a", item_uuid="u-1")
@@ -101,6 +102,9 @@ def test_route_lists_ids_and_summary(js):
 
     app = FastAPI()
     app.include_router(files_route.router)
+    # A rota exige admin do DSpace (backend/api/auth.py); o assunto aqui é o índice
+    # do job_store — a autorização é coberta em tests/test_admin_auth.py.
+    app.dependency_overrides[dspace_admin] = lambda: {"eperson": None}
     resp = TestClient(app).get("/api/files/succeeded")
 
     assert resp.status_code == 200

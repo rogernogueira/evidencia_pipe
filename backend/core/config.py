@@ -108,6 +108,37 @@ DSPACE_ITEM_RETRY_WHEN_NO_PDF = (
 )
 
 # --------------------------------------------------------------------------
+# Autorização administrativa (backend/api/auth.py). Quem autoriza é o DSpace:
+# as rotas de ingestão exigem o MESMO Bearer que o dspace-angular já usa, e a
+# API pergunta ao DSpace se aquele token é de um administrador do repositório.
+# Não há chave/segredo próprio — um segredo compartilhado seria um segundo
+# universo de permissões para manter em dia.
+#
+# Base REST do DSpace. Por padrão deriva de DSPACE_URL (mesma convenção de
+# dspace_service.py: {DSPACE_URL}/server/api/...). Preencha só quando o DSpace
+# que AUTENTICA o front não for o mesmo de onde os PDFs são baixados.
+# --------------------------------------------------------------------------
+DSPACE_SERVER_URL = os.getenv("DSPACE_SERVER_URL", f"{DSPACE_URL}/server").strip().rstrip("/")
+
+# Desliga a exigência de Bearer nas rotas administrativas. SÓ para desenvolvimento
+# local sem DSpace à mão: com "false", /api/files/* fica aberto a quem alcançar a
+# API. Em produção deixe ligado (o servidor loga um aviso quando estiver desligado).
+ADMIN_AUTH_ENABLED = os.getenv("ADMIN_AUTH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+# Validade do resultado da validação, por token. NÃO é otimização: a aba de
+# Ingestão do front recarrega a cada 5s em até 3 listas paralelas — sem cache
+# seriam ~36 consultas/minuto ao DSpace por administrador com a tela aberta.
+# A chave é o SHA-256 do token (o token em claro nunca é guardado nem logado) e
+# a entrada é descartada assim que o DSpace responder 401.
+ADMIN_AUTH_CACHE_TTL_SECONDS = float(os.getenv("ADMIN_AUTH_CACHE_TTL_SECONDS", "45"))
+# Teto de tokens distintos no cache — impede que uma enxurrada de tokens inválidos
+# (que não são cacheados) ou muitos operadores simultâneos façam o dicionário crescer.
+ADMIN_AUTH_CACHE_MAX_ENTRIES = int(os.getenv("ADMIN_AUTH_CACHE_MAX_ENTRIES", "512"))
+# Timeout de cada chamada ao DSpace na validação. Curto de propósito: o front está
+# esperando a lista, e DSpace lento vira 503 (retry), não 401 (relogar à toa).
+ADMIN_AUTH_TIMEOUT_SECONDS = float(os.getenv("ADMIN_AUTH_TIMEOUT_SECONDS", "5"))
+
+# --------------------------------------------------------------------------
 # Proxy reverso que REMOVE o prefixo do caminho (ver DEPLOY.md §8.1 e
 # backend/api/proxy_prefix.py). Vazio = comportamento normal, sem middleware.
 # Só preencha (com "/api") onde a borda estiver com ProxyPass reescrevendo para a

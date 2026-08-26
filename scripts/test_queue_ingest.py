@@ -9,9 +9,18 @@ com GET /api/files/failures.
 
 Só usa a stdlib (urllib) — nenhuma dependência externa.
 
+AUTORIZAÇÃO: as rotas consultadas aqui (status/failures) exigem um Bearer de
+administrador do DSpace — ver backend/api/auth.py. Passe-o em --token ou na
+variável RDAPP_ADMIN_TOKEN. O token sai do login do DSpace:
+
+    TOKEN=$(curl -si -X POST "$DSPACE/server/api/authn/login" \
+              -d "user=admin@exemplo.edu&password=..." \
+              | grep -i '^authorization:' | cut -d' ' -f3)
+
 Uso:
     python scripts/test_queue_ingest.py                      # usa a lista embutida
     python scripts/test_queue_ingest.py --base-url http://127.0.0.1:8020
+    python scripts/test_queue_ingest.py --token "$TOKEN"     # ou RDAPP_ADMIN_TOKEN=...
     python scripts/test_queue_ingest.py --force              # reprocessa do zero
     python scripts/test_queue_ingest.py --uuids-file ids.txt # 1 uuid por linha
     python scripts/test_queue_ingest.py --timeout 0          # sem teto de espera
@@ -24,6 +33,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -103,10 +113,16 @@ UUIDS = [
 ]
 
 
+# Bearer de admin do DSpace, preenchido em main() (--token / RDAPP_ADMIN_TOKEN).
+TOKEN = ""
+
+
 def _request(method: str, url: str, timeout: float = 30.0) -> tuple[int, object]:
     """HTTP simples. Retorna (status_code, corpo_json_ou_texto). status_code=0 em
     falha de conexão."""
     req = urllib.request.Request(url, method=method)
+    if TOKEN:
+        req.add_header("Authorization", f"Bearer {TOKEN}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "replace")
@@ -171,7 +187,12 @@ def main() -> int:
     ap.add_argument("--enqueue-workers", type=int, default=8, help="concorrência do enfileiramento")
     ap.add_argument("--uuids-file", help="arquivo com 1 uuid de item por linha (sobrescreve a lista embutida)")
     ap.add_argument("--out-prefix", default=None, help="prefixo dos arquivos de relatório")
+    ap.add_argument("--token", default=os.environ.get("RDAPP_ADMIN_TOKEN", ""),
+                    help="Bearer de admin do DSpace (padrão: $RDAPP_ADMIN_TOKEN)")
     args = ap.parse_args()
+
+    global TOKEN
+    TOKEN = args.token.strip()
 
     base_url = args.base_url.rstrip("/")
     uuids = UUIDS
@@ -188,6 +209,15 @@ def main() -> int:
     code, _ = _request("GET", f"{base_url}/openapi.json", timeout=10)
     if code == 0:
         print(f"ERRO: não consegui falar com a API em {base_url}. A app está no ar (porta 8020)?")
+        return 1
+
+    # Sanidade: o token dá acesso à fila? Sem isto o polling receberia 401 em toda
+    # ronda e só falharia no timeout global, horas depois.
+    code, _ = _request("GET", f"{base_url}/api/files/active?limit=1", timeout=10)
+    if code in (401, 403):
+        print(f"ERRO: HTTP {code} em /api/files/active — as rotas da fila exigem um "
+              "Bearer de administrador do DSpace. Passe --token ou RDAPP_ADMIN_TOKEN "
+              "(ver o cabeçalho deste script).")
         return 1
 
     # ---------------- Fase 1: enfileirar (por item) ----------------

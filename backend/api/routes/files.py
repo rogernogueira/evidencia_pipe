@@ -22,13 +22,24 @@ acompanhada pelo registro `item:{uuid}` no job_store (ver backend/services/inges
 Os endpoints de status/resultado NÃO retornam artefatos completos — só um resumo.
 Para baixar um artefato use o endpoint interno de URL pré-assinada
 (backend/api/routes/artifacts.py).
+
+AUTORIZAÇÃO: as rotas que MOSTRAM a fila (active/succeeded/failures/status/result)
+e a que a reprocessa exigem um Bearer de administrador do DSpace — ver
+backend/api/auth.py, que também protege o `/api/status`. A busca (`/api/search/*`) e
+o `/health` continuam abertos.
+As rotas de ENFILEIRAMENTO (`POST /api/files/dspace/...`) e o `POST /api/files/enrich`
+seguem abertas: quem as chama é a sincronização automática
+(scripts/sincronizar_novos_itens.py), que roda no próprio host e não tem sessão DSpace.
+O destino delas NÃO é o Bearer — é sair do acesso externo e ficar alcançáveis só pela
+rede local. Ver o comentário em cada uma e DEPLOY.md §8.2.
 """
 
 import urllib.error
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from backend.api.auth import dspace_admin
 from backend.core.logger import log_api
 from backend.core.schemas import (
     ART_METADATA_CANDIDATES,
@@ -50,6 +61,11 @@ from backend.services.job_store import (
 router = APIRouter()
 
 
+# ABERTA POR ORA, MAS NÃO PARA SEMPRE: o plano é tirá-la do acesso externo e deixá-la
+# alcançável só pela rede local (borda/firewall), não com Bearer. Quem a chama é a
+# sincronização periódica (scripts/sincronizar_novos_itens.py), que roda no próprio
+# host e não tem sessão DSpace para apresentar — exigir admin aqui derrubaria a
+# ingestão automática. Ver a nota de AUTORIZAÇÃO no topo do módulo e DEPLOY.md §8.2.
 @router.post("/api/files/dspace/item/{uuid}")
 def ingest_dspace_item(uuid: str, force: bool = Query(default=False)) -> JSONResponse:
     """Resolve os PDFs do bundle ORIGINAL de um item DSpace e enfileira uma chain
@@ -128,6 +144,11 @@ def _aguardar_item(uuid: str, force: bool, exc: Exception) -> JSONResponse:
     )
 
 
+# ABERTA POR ORA, MAS NÃO PARA SEMPRE: o plano é tirá-la do acesso externo e deixá-la
+# alcançável só pela rede local (borda/firewall), não com Bearer. Quem a chama é a
+# sincronização periódica (scripts/sincronizar_novos_itens.py), que roda no próprio
+# host e não tem sessão DSpace para apresentar — exigir admin aqui derrubaria a
+# ingestão automática. Ver a nota de AUTORIZAÇÃO no topo do módulo e DEPLOY.md §8.2.
 @router.post("/api/files/dspace/{uuid}")
 def ingest_dspace_bitstream(uuid: str, force: bool = Query(default=False)) -> JSONResponse:
     """Enfileira a chain completa para um bitstream avulso. Diferente da v1, o
@@ -153,7 +174,7 @@ def ingest_dspace_bitstream(uuid: str, force: bool = Query(default=False)) -> JS
     )
 
 
-@router.get("/api/files/status/{job_id}")
+@router.get("/api/files/status/{job_id}", dependencies=[Depends(dspace_admin)])
 def job_status(job_id: str) -> JSONResponse:
     """Status resumido do job (do job_store). Não retorna artefatos."""
     job = get_job(job_id)
@@ -162,7 +183,7 @@ def job_status(job_id: str) -> JSONResponse:
     return JSONResponse(job)
 
 
-@router.get("/api/files/result/{job_id}")
+@router.get("/api/files/result/{job_id}", dependencies=[Depends(dspace_admin)])
 def job_result(job_id: str) -> JSONResponse:
     """Resultado resumido do job (§30) — NÃO devolve o conteúdo dos artefatos.
 
@@ -193,6 +214,9 @@ def job_result(job_id: str) -> JSONResponse:
     })
 
 
+# ABERTA POR ORA, MAS NÃO PARA SEMPRE: mesmo destino das rotas de enfileiramento —
+# sai do acesso externo e fica restrita à rede local. Esta é a primeira candidata:
+# cada chamada gasta LLM, e nenhum consumidor legítimo dela vem da internet.
 @router.post("/api/files/enrich/{job_id}")
 def enrich_job_metadata(
     job_id: str,
@@ -249,7 +273,7 @@ def enrich_job_metadata(
     return JSONResponse(store.read_json(ref.object_key))
 
 
-@router.get("/api/files/active")
+@router.get("/api/files/active", dependencies=[Depends(dspace_admin)])
 def list_active_jobs(limit: int = Query(default=100, ge=1, le=1000)) -> JSONResponse:
     """Lista os **jobs em execução** (mais recentes primeiro): os que estão `na_fila`
     ou `processando`. Devolve os IDs em `job_ids` e um resumo por job (status, estágio
@@ -273,7 +297,7 @@ def list_active_jobs(limit: int = Query(default=100, ge=1, le=1000)) -> JSONResp
     })
 
 
-@router.get("/api/files/succeeded")
+@router.get("/api/files/succeeded", dependencies=[Depends(dspace_admin)])
 def list_succeeded_jobs(limit: int = Query(default=100, ge=1, le=1000)) -> JSONResponse:
     """Lista os **últimos jobs bem sucedidos** (mais recentes primeiro): concluídos e
     indexados sem erro. Devolve os IDs em `job_ids` e um resumo por job (contagens de
@@ -305,7 +329,7 @@ def list_succeeded_jobs(limit: int = Query(default=100, ge=1, le=1000)) -> JSONR
     })
 
 
-@router.get("/api/files/failures")
+@router.get("/api/files/failures", dependencies=[Depends(dspace_admin)])
 def list_failures(limit: int = Query(default=100, ge=1, le=1000)) -> JSONResponse:
     """Lista os jobs na **fila de falhas** (mais recentes primeiro) — jobs que
     falharam num estágio ou concluíram com erro de índice. Cada item é o registro
@@ -315,7 +339,11 @@ def list_failures(limit: int = Query(default=100, ge=1, le=1000)) -> JSONRespons
 
 
 @router.post("/api/files/reprocess/{job_id}")
-def reprocess_job(job_id: str, force: bool = Query(default=True)) -> JSONResponse:
+def reprocess_job(
+    job_id: str,
+    force: bool = Query(default=True),
+    admin: dict = Depends(dspace_admin),
+) -> JSONResponse:
     """Re-enfileira a chain de ingestão de um job que falhou, reusando a origem
     (bitstream/item) registrada no job_store. `force=true` (padrão) ignora artefatos
     existentes e reprocessa do zero; `force=false` reaproveita etapas já concluídas
@@ -324,7 +352,9 @@ def reprocess_job(job_id: str, force: bool = Query(default=True)) -> JSONRespons
     Para o registro de um ITEM que ficou indisponível no DSpace (`item:{uuid}`, ver
     POST /api/files/dspace/item/{uuid}) o que se reenfileira é a RESOLUÇÃO do item —
     a contagem de tentativas recomeça e a primeira é imediata."""
-    log_api.info("POST /api/files/reprocess/%s force=%s", job_id, force)
+    log_api.info("POST /api/files/reprocess/%s force=%s [admin=%s sessao=%s]", job_id, force,
+                 admin.get("eperson_email") or admin.get("eperson_uuid") or "?",
+                 admin.get("sessao"))
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' desconhecido.")

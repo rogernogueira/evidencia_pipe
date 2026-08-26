@@ -29,7 +29,12 @@ O que muda em relação à v1, e por quê:
   * **Checagem antes de colher.** Consulta `GET /api/status`; se a capacidade
     `ingestao` estiver indisponível (MinIO fora, Redis fora, worker parado), pula a
     rodada **sem** avançar a marca d'água — nada se perde, e não se queima uma
-    janela mandando POST para um pipeline que não consegue processar.
+    janela mandando POST para um pipeline que não consegue processar. Essa rota
+    exige Bearer de admin do DSpace: com `RDAPP_ADMIN_TOKEN` (ou `--token`) a
+    checagem acontece — o que serve para execução manual, já que o token do DSpace
+    é de vida curta e no cron o normal é ele já ter expirado. Sem token válido a
+    rodada SEGUE e o log registra que não deu para checar: 401 é "não enxerguei",
+    não "o pipeline está fora", e pular por isso pararia a sincronização para sempre.
   * **Log em arquivo, silêncio no stdout.** Tudo vai para `logs/sincronizacao.log`
     (rotativo). No stdout/stderr só sai WARNING+, então o cron **só manda e-mail
     quando há problema**. Com `--verboso` o log também aparece no terminal.
@@ -276,13 +281,29 @@ def configurar_bases(dspace: str, rdapp: str) -> None:
     base.RDAPP_BASE = rdapp.rstrip("/")
 
 
-def checar_ingestao(rdapp_base: str) -> Tuple[bool, str]:
-    """A API consegue ingerir agora? (`capabilities.ingestao` de GET /api/status)."""
+def checar_ingestao(rdapp_base: str, token: str = "") -> Tuple[bool, str]:
+    """A API consegue ingerir agora? (`capabilities.ingestao` de GET /api/status).
+
+    Retorna (pode_seguir, motivo). Duas situações diferentes cabem em `pode_seguir=True`:
+    a capacidade está disponível (motivo vazio) ou **não foi possível checar** (motivo
+    preenchido) — quem chama registra a segunda e segue.
+
+    O `/api/status` exige Bearer de administrador do DSpace (ver DEPLOY.md §8.2) e
+    este script roda sem sessão. Com RDAPP_ADMIN_TOKEN a checagem funciona como
+    sempre; sem ele, um 401/403 significa "não enxerguei", não "o pipeline está
+    fora" — pular a rodada por isso pararia a sincronização para sempre.
+    """
     url = f"{rdapp_base}/api/status?artifacts=false"
+    headers = {"User-Agent": base.USER_AGENT}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        r = requests.get(url, timeout=(10, 30), headers={"User-Agent": base.USER_AGENT})
+        r = requests.get(url, timeout=(10, 30), headers=headers)
     except requests.RequestException as e:
         return False, f"{url} inacessível: {type(e).__name__}: {e}"
+    if r.status_code in (401, 403):
+        return True, (f"{url} respondeu HTTP {r.status_code} — a rota exige admin do "
+                      "DSpace e não há token (defina RDAPP_ADMIN_TOKEN ou use --token)")
     try:
         dados = r.json()
     except ValueError:
@@ -387,12 +408,14 @@ async def rodar(args: argparse.Namespace, estado: Estado) -> int:
     prazo = inicio + args.tempo_maximo if args.tempo_maximo else None
 
     if not args.sem_envio and not args.sem_checagem:
-        pode, motivo = checar_ingestao(args.rdapp_base)
+        pode, motivo = checar_ingestao(args.rdapp_base, args.token)
         if not pode:
             log.warning("rodada pulada — %s", motivo)
             estado.ultima_execucao = iso(agora())
             estado.salvar()
             return 3
+        if motivo:  # deu para seguir, mas a checagem não foi feita (ver checar_ingestao)
+            log.warning("seguindo sem a checagem prévia — %s", motivo)
 
     handles_ok, uuids_ok = base.ler_ja_enviados(args.csv)
     completo, desde = montar_janela(estado, args)
@@ -669,6 +692,10 @@ def main() -> int:
     p.add_argument("--metadata-prefix", default="oai_dc", help="metadataPrefix do OAI-PMH")
     p.add_argument("--dspace-base", default=os.environ.get("DSPACE_URL", base.DSPACE_BASE))
     p.add_argument("--rdapp-base", default=os.environ.get("RDAPP_API_URL", base.RDAPP_BASE))
+    p.add_argument("--token", default=os.environ.get("RDAPP_ADMIN_TOKEN", ""),
+                   help="Bearer de admin do DSpace para a checagem prévia (padrão: "
+                        "$RDAPP_ADMIN_TOKEN). Token do DSpace expira: sem um válido, a "
+                        "checagem é pulada e a rodada segue")
     p.add_argument("--crontab", action="store_true", help="imprime a linha do crontab e sai")
     p.add_argument("--mostrar-estado", action="store_true", help="imprime o estado atual e sai")
     args = p.parse_args()

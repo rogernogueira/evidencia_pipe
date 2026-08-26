@@ -3,8 +3,21 @@
     GET /api/status              → todos os componentes + capacidades derivadas
     GET /api/status/{component}  → um componente só (polling barato e dirigido)
 
-A sondagem vive em backend/services/infra_status.py; aqui ficam a rota, o nível de
-detalhe e o código HTTP.
+A sondagem vive em backend/services/infra_status.py; aqui ficam a rota, a
+autorização, o nível de detalhe e o código HTTP.
+
+Autorização
+-----------
+As duas rotas exigem Bearer de administrador do DSpace (backend/api/auth.py), em
+QUALQUER caminho — pela borda ou direto na porta do backend. O status descreve a
+infraestrutura inteira (o que está fora, quantos chunks existem, quais capacidades
+estão bloqueadas): é informação de operação, não de consulta pública.
+
+Consequência para quem opera: os `curl` de acompanhamento precisam do token (ver
+DEPLOY.md §9), e a sincronização periódica, que consulta `capabilities.ingestao`
+antes de colher, degrada para "não consegui checar" quando não tem token — ela
+segue a rodada em vez de pulá-la (scripts/sincronizar_novos_itens.py). Liveness sem
+token continua existindo: `/health`.
 
 Nível de detalhe
 ----------------
@@ -19,14 +32,17 @@ serializado para quem tem por que vê-lo:
 
 Por que não simplesmente pôr a rota inteira sob `/internal`: um painel de operação
 consome a API pela borda (é assim que o front alcança o backend), e um status que só
-responde na rede interna não serve para ele. O que a borda não precisa ver é a
-topologia — e é exatamente ela que fica atrás do token. `detail_level` na resposta diz
-qual dos dois níveis veio, para o consumidor não confundir campo ausente com problema.
+responde na rede interna não serve para ele. O Bearer resolve QUEM pode consultar; o
+nível de detalhe é outra pergunta e continua valendo por cima dele — nem todo admin
+autenticado precisa receber URLs, hostnames e PIDs dentro do navegador. `detail_level`
+na resposta diz qual dos dois níveis veio, para o consumidor não confundir campo
+ausente com problema.
 
 As opções caras (`fresh`, `probe`) também são restritas ao nível completo: sem isso um
-consumidor anônimo poderia forçar broadcast de Celery, varredura do bucket e
-round-trip de embedding a cada requisição. Quem chega pela borda não força remedição —
-a resposta vem do cache enquanto ele vale, então uma consulta frequente custa, no
+painel aberto na tela forçaria broadcast de Celery, varredura do bucket e round-trip
+de embedding a cada recarga — o Bearer diz que a pessoa pode consultar, não que a
+consulta possa custar o que quiser. Quem chega pela borda não força remedição: a
+resposta vem do cache enquanto ele vale, então uma consulta frequente custa, no
 máximo, uma medição por STATUS_CACHE_TTL_SECONDS.
 
 Código HTTP: 200 quando o pipeline está de pé (mesmo degradado) e 503 quando um
@@ -34,9 +50,10 @@ componente CRÍTICO está fora, para um monitor externo poder olhar só o status
 resposta. O corpo é o mesmo JSON nos dois casos.
 """
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
+from backend.api.auth import dspace_admin
 from backend.api.proxy_prefix import veio_da_borda
 from backend.core import config as settings
 from backend.core.logger import log_api
@@ -52,7 +69,7 @@ def _detalhe_completo(request: Request, token: str | None) -> bool:
     return not veio_da_borda(request.scope)
 
 
-@router.get("/api/status")
+@router.get("/api/status", dependencies=[Depends(dspace_admin)])
 def infra_status_geral(
     request: Request,
     fresh: bool = Query(default=False, description="Ignora o cache e remede tudo (só no detalhe completo)"),
@@ -80,7 +97,7 @@ def infra_status_geral(
     return JSONResponse(corpo, status_code=503 if corpo["status"] == infra_status.DOWN else 200)
 
 
-@router.get("/api/status/{component}")
+@router.get("/api/status/{component}", dependencies=[Depends(dspace_admin)])
 def infra_status_componente(
     request: Request,
     component: str,

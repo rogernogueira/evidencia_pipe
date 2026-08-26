@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
+from backend.api.auth import dspace_admin  # noqa: E402
 from backend.api.routes import status as status_route  # noqa: E402
 from backend.core import config as settings  # noqa: E402
 from backend.services import infra_status as st  # noqa: E402
@@ -37,9 +38,16 @@ def comp(nome="x", status=st.OK, *, critical=False, detail=None, internal=None):
                         detail=detail or {}, internal=internal or {})
 
 
-def make_client():
+def make_client(*, autorizado=True):
+    """App mínimo com o status.router. As rotas exigem admin do DSpace
+    (backend/api/auth.py); aqui o assunto é a agregação e o nível de detalhe, então a
+    autorização é dispensada por padrão — quem a testa é tests/test_admin_auth.py e
+    `test_status_exige_admin` logo abaixo."""
     app = FastAPI()
     app.include_router(status_route.router)
+    if autorizado:
+        app.dependency_overrides[dspace_admin] = lambda: {"eperson_email": None,
+                                                          "sessao": "teste"}
     return TestClient(app)
 
 
@@ -643,6 +651,17 @@ def instala_snapshot(monkeypatch, componentes: dict):
     monkeypatch.setattr(st, "COMPONENT_ORDER", tuple(componentes))
     monkeypatch.setattr(st, "registry",
                         lambda opts: {n: (lambda c=c: c) for n, c in componentes.items()})
+
+
+def test_status_exige_admin(monkeypatch):
+    """O status descreve a infraestrutura inteira — é informação de operação, não de
+    consulta pública. Vale para os dois caminhos: pela borda e direto na porta."""
+    instala_snapshot(monkeypatch, componentes_saudaveis())
+    c = make_client(autorizado=False)
+
+    assert c.get("/api/status").status_code == 401
+    assert c.get("/api/status", headers=DA_BORDA).status_code == 401
+    assert c.get("/api/status/qdrant").status_code == 401
 
 
 def test_rota_devolve_200_e_o_corpo_completo(monkeypatch):

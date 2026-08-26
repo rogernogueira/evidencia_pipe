@@ -94,19 +94,34 @@ ou com chaves proibidas (`markdown`, `chunks`, `embeddings`, `pdf_bytes`, …).
 |--------|------|-----------|
 | `POST` | `/api/files/dspace/item/{uuid}` | **Principal** — ingere todos os PDFs de um item DSpace. `?force=true` reprocessa. Item ainda indisponível no DSpace **não** dá 502: a ingestão fica na fila e o item é reconsultado com backoff (ver [CELERY.md](CELERY.md)). |
 | `POST` | `/api/files/dspace/{uuid}` | Ingere um bitstream (PDF) específico (download roda no worker). |
-| `GET`  | `/api/files/status/{job_id}` | Status resumido do job (sem artefatos). |
-| `GET`  | `/api/files/result/{job_id}` | **Resumo** do resultado (contagens + `artifact_id`) — não devolve o conteúdo. |
+| `GET`  | `/api/files/status/{job_id}` 🔒 | Status resumido do job (sem artefatos). |
+| `GET`  | `/api/files/result/{job_id}` 🔒 | **Resumo** do resultado (contagens + `artifact_id`) — não devolve o conteúdo. |
 | `POST` | `/api/files/enrich/{job_id}` | Roda o enrich por LLM (desacoplado) sobre um job (lê o markdown do MinIO); se já indexado, propaga ao Qdrant. |
-| `GET`  | `/api/files/active` | Lista os **jobs em execução** (`na_fila`/`processando`): IDs + resumo (estágio, arquivo, `updated_at`), mais recentes primeiro. |
-| `GET`  | `/api/files/succeeded` | Lista os **últimos jobs bem sucedidos** (concluídos sem `index_error`): IDs + resumo (chunks, indexados, `artifact_id`), mais recentes primeiro. |
-| `GET`  | `/api/files/failures` | Lista os jobs na **fila de falhas** (erro num estágio ou `index_error`), mais recentes primeiro. |
-| `POST` | `/api/files/reprocess/{job_id}` | Re-enfileira a chain de um job que falhou (reusa a origem; `?force=true` reprocessa do zero). Em `item:{uuid}`, reinicia a espera pelo item no DSpace. |
-| `GET`  | `/api/status` | **Estado de toda a infraestrutura** + o que o sistema consegue fazer agora. Ver abaixo. |
-| `GET`  | `/api/status/{component}` | Um componente só (`qdrant`, `minio`, `celery`, …), com o mesmo cache. |
+| `GET`  | `/api/files/active` 🔒 | Lista os **jobs em execução** (`na_fila`/`processando`): IDs + resumo (estágio, arquivo, `updated_at`), mais recentes primeiro. |
+| `GET`  | `/api/files/succeeded` 🔒 | Lista os **últimos jobs bem sucedidos** (concluídos sem `index_error`): IDs + resumo (chunks, indexados, `artifact_id`), mais recentes primeiro. |
+| `GET`  | `/api/files/failures` 🔒 | Lista os jobs na **fila de falhas** (erro num estágio ou `index_error`), mais recentes primeiro. |
+| `POST` | `/api/files/reprocess/{job_id}` 🔒 | Re-enfileira a chain de um job que falhou (reusa a origem; `?force=true` reprocessa do zero). Em `item:{uuid}`, reinicia a espera pelo item no DSpace. |
+| `GET`  | `/api/status` 🔒 | **Estado de toda a infraestrutura** + o que o sistema consegue fazer agora. Ver abaixo. |
+| `GET`  | `/api/status/{component}` 🔒 | Um componente só (`qdrant`, `minio`, `celery`, …), com o mesmo cache. |
 | `GET`  | `/internal/artifacts/{pipeline_id}/{document_id}/{artifact_name}/download-url` | URL pré-assinada curta (autorizada via `X-Internal-Token`). |
 | `GET`  | `/internal/artifacts/health` | Health check do MinIO (bucket/leitura/escrita). |
 | `GET`  | `/internal/gpu/status` | Status do recurso de GPU (dono, TTL, fila). Não expor publicamente. |
 | `GET`  | `/internal/gpu/queue` | Fila de solicitações de GPU (prioridade efetiva). |
+
+> 🔒 = exige `Authorization: Bearer <token do DSpace>` de um **administrador do
+> repositório**. Quem autoriza é o próprio DSpace: a API valida o token em
+> `/api/authn/status` e pergunta em `/api/authz/authorizations/search/object`
+> (`feature=administratorOf`) se o dono é admin — é o mesmo token e a mesma checagem
+> que o dspace-angular já usa, então não há login separado nem chave compartilhada.
+> Sem token → **401**; token válido de quem não é admin → **403**; DSpace fora do ar
+> ou lento na validação → **503** (nunca 401: isso mandaria o operador relogar à toa).
+> Ver [backend/api/auth.py](backend/api/auth.py) e as variáveis `ADMIN_AUTH_*` no
+> [.env.example](.env.example). O DSpace que valida os tokens não precisa ser o mesmo
+> de onde vêm os PDFs — `DSPACE_SERVER_URL` é independente de `DSPACE_URL`.
+> As rotas de **enfileiramento** (e o `enrich`) seguem
+> abertas — quem as chama é a sincronização automática, que roda no host e não tem
+> sessão DSpace. O destino delas não é o Bearer: é sair do acesso externo e ficar
+> restritas à rede local (borda/firewall). Ver [DEPLOY.md §8.2](DEPLOY.md).
 
 > O download de conteúdo é feito **apenas** via URL pré-assinada (curta, gerada sob
 > demanda, nunca persistida no manifesto/logs). O bucket é **privado** (sem acesso
@@ -143,11 +158,16 @@ consegue fazer agora** (`busca`, `ingestao`, `extracao`, `indexacao`,
 `enriquecimento_llm`), cada uma com os componentes que a bloqueiam — e `config`, a
 configuração que define a semântica do índice (chunking, embedding, filtros de busca).
 
+A rota **exige Bearer de administrador do DSpace**, inclusive de dentro do host: ela
+descreve a infraestrutura toda. Como obter o `$TOKEN` (o login do DSpace exige token
+CSRF) está em [DEPLOY.md §8.2](DEPLOY.md); sem token, o que responde é o `/health`.
+
 ```bash
-curl -s http://127.0.0.1:8020/api/status | jq '{status, capabilities, blocking}'
-curl -s http://127.0.0.1:8020/api/status/celery          # só os workers
-curl -s 'http://127.0.0.1:8020/api/status?probe=true'    # + round-trip de embedding
-curl -s 'http://127.0.0.1:8020/api/status?artifacts=false'  # pula a contagem no MinIO
+A="Authorization: Bearer $TOKEN"
+curl -s -H "$A" http://127.0.0.1:8020/api/status | jq '{status, capabilities, blocking}'
+curl -s -H "$A" http://127.0.0.1:8020/api/status/celery          # só os workers
+curl -s -H "$A" 'http://127.0.0.1:8020/api/status?probe=true'    # + round-trip de embedding
+curl -s -H "$A" 'http://127.0.0.1:8020/api/status?artifacts=false'  # pula a contagem no MinIO
 ```
 
 **Código HTTP**: 200 com o pipeline de pé (mesmo degradado), **503** quando um
