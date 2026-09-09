@@ -45,6 +45,52 @@ class SearchResult(BaseModel):
     item_handle: Optional[str] = Field(None, description="Handle do item DSpace de origem, se houver")
 
 
+# --------------------------------------------------------------------------
+# AI Summary (GET /api/search/summarize) — síntese das evidências recuperadas.
+# Modelos ADITIVOS: não alteram SearchResult (contrato de 7 campos consumido pelo
+# Angular do DSpace). Nesta 1ª iteração não há filtros de metadados nem grupo
+# Centralised/Decentralised — ver decisão de escopo.
+# --------------------------------------------------------------------------
+
+class EvidenceMapping(BaseModel):
+    """Origem de uma evidência citada como [N] no summary — rastreia o chunk até o
+    item no DSpace, sem repetir o texto integral."""
+    index: int = Field(..., description="Número da evidência (o N de [N] no texto)")
+    chunk_id: Optional[str] = Field(None, description="ID do chunk no índice")
+    document_id: Optional[str] = Field(None, description="ID do documento de origem")
+    dspace_uuid: Optional[str] = Field(None, description="UUID do item DSpace (item_uuid)")
+    item_handle: Optional[str] = Field(None, description="Handle do item DSpace, se houver")
+    section: str = Field("", description="Seção a que o chunk pertence")
+    page: Optional[int] = Field(None, description="Página de origem do chunk")
+    score: Optional[float] = Field(None, description="Score de relevância do retrieval")
+    snippet: str = Field("", description="Trecho do chunk usado como evidência")
+
+
+class RetrievalMetadata(BaseModel):
+    """Parâmetros do retrieval que originou as evidências — transparência do contrato."""
+    type: str = Field("hybrid", description="Modo do retrieval: hybrid | dense | sparse")
+    fusion: Optional[str] = Field(None, description="Fusão no modo híbrido (rrf)")
+    top: int = Field(0, description="Máximo de chunks solicitados ao índice")
+    evidence_count: int = Field(0, description="Nº de evidências após deduplicação")
+
+
+class SummaryResponse(BaseModel):
+    """Resposta do AI Summary: síntese das evidências recuperadas pela busca
+    semântica, com citações [N] validadas contra `mappings`. Expõe os filtros
+    aplicados e os parâmetros de retrieval (contrato transparente)."""
+    query: str = Field(..., description="Consulta original")
+    language: str = Field("pt-BR", description="Idioma da síntese")
+    applied_filters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Filtros de metadados aplicados (vazio nesta iteração)",
+    )
+    retrieval: RetrievalMetadata = Field(..., description="Parâmetros do retrieval")
+    summary: str = Field("", description="Texto sintetizado, com citações [N]")
+    mappings: list[EvidenceMapping] = Field(
+        default_factory=list, description="Origem de cada evidência numerada"
+    )
+
+
 class LlmMetadataCandidates(BaseModel):
     """Metadados candidatos extraídos do markdown por uma LLM (DeepSeek).
 

@@ -221,6 +221,33 @@ LLM_ENRICH_REVIEW_THRESHOLD = float(
 # agora desacoplado da indexação.
 LLM_ENRICH_AUTO = (os.getenv("LLM_ENRICH_AUTO", "true").strip().lower() in {"1", "true", "yes", "on"})
 
+# --------------------------------------------------------------------------
+# AI Summary (GET /api/search/summarize) — usa a MESMA config de LLM do enrich, com
+# dois pontos próprios: o modelo e o "thinking".
+#
+# O resumo é texto livre, e é aí que modelo de raciocínio atrapalha: o rascunho vaza
+# no `content` (um `</think>` órfão seguido de texto em chinês — o modelo raciocina no
+# idioma de treino) e, pior, consome o orçamento de tokens, podendo devolver `content`
+# VAZIO. O enrich não sofre porque pede `response_format=json_object`.
+#
+# Medido no provedor em uso (deepseek-v4-flash, 02/09/2026, prompt trivial com
+# max_tokens=64): sem parâmetro, `reasoning_content` com 232 caracteres e `content`
+# vazio; com `thinking={"type":"disabled"}`, `content="ok"` e nenhum raciocínio.
+# `reasoning_effort="none"` teve o mesmo efeito; `chat_template_kwargs` e
+# `enable_thinking` foram aceitos e IGNORADOS.
+#
+# Desligado por padrão, portanto. O parâmetro não é universal: se o provedor recusar
+# a requisição por causa dele, o serviço refaz a chamada sem o parâmetro e passa a
+# omiti-lo (ver summary_service._call_llm) — e o saneamento da resposta
+# (summary_service._strip_reasoning) segue como rede de segurança em qualquer caso.
+# --------------------------------------------------------------------------
+LLM_SUMMARY_DISABLE_THINKING = (
+    os.getenv("LLM_SUMMARY_DISABLE_THINKING", "true").strip().lower() in {"1", "true", "yes", "on"}
+)
+# Modelo do resumo. Por padrão o mesmo do enrich; separado para permitir usar no
+# resumo um modelo diferente do da extração de metadados, sem duplicar config.
+LLM_SUMMARY_MODEL = (os.getenv("LLM_SUMMARY_MODEL") or LLM_ENRICH_MODEL).strip()
+
 # Aliases legados (compatibilidade com imports/código existente).
 DEEPSEEK_API_KEY = LLM_ENRICH_API_KEY
 DEEPSEEK_BASE_URL = LLM_ENRICH_BASE_URL
