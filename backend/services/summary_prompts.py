@@ -68,7 +68,7 @@ Não introduza novas informações na conclusão.
 Escreva TODA a resposta no idioma solicitado pelo usuário, incluindo títulos e
 textos de ligação. Utilize o português (pt-BR) como padrão caso o idioma solicitado não possa
 ser determinado. Nunca altere o idioma ou o sistema de escrita no meio da resposta;
-a única exceção é um nome próprio ou uma breve citação copiada literalmente. com base nas evidências.
+a única exceção é um nome próprio ou uma breve citação copiada literalmente.
 
 Forneça apenas a síntese. Não apresente seu raciocínio, planejamento,
 deliberação ou verificações internas, nem utilize delimitadores de raciocínio como <think>,
