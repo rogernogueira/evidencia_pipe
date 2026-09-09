@@ -133,6 +133,79 @@ class SemanticSearch:
     def available(self) -> bool:
         return self._available
 
+    def _build_query_filter(
+        self, query: str, doc_id: Optional[str], uuid: Optional[str], profile: str
+    ) -> Optional[Filter]:
+        """Monta o Filter do Qdrant: `uuid` → item_uuid, `doc_id` → doc_id, e o
+        filtro por perfil de recuperação (§21). Retorna None se nada a filtrar."""
+        conditions: list = []
+        must_not: list = []
+        if uuid and uuid.strip():
+            conditions.append(FieldCondition(key="item_uuid", match=MatchValue(value=uuid.strip())))
+        if doc_id and doc_id.strip():
+            conditions.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id.strip())))
+
+        explicit = (profile or "").strip().lower()
+        if explicit or _search_filtering_enabled():
+            resolved = explicit or (detect_query_profile(query) or SEARCH_DEFAULT_PROFILE or PROFILE_GENERAL)
+            p_must, p_must_not = _profile_conditions(resolved)
+            conditions.extend(p_must)
+            must_not.extend(p_must_not)
+            # §11: dados visuais de baixa confiança fora de QUALQUER perfil (global).
+            if SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA:
+                must_not.append(FieldCondition(
+                    key="chart_data_confidence", range=Range(lt=CHUNK_CHART_MIN_CONFIDENCE)))
+            log_api.info("search profile=%r (resolvido de %r)", resolved, explicit or "auto")
+
+        if not (conditions or must_not):
+            return None
+        return Filter(must=conditions or None, must_not=must_not or None)
+
+    async def _query_points(
+        self, query: str, limit: int, type: str, query_filter: Optional[Filter]
+    ) -> list:
+        """Embeda a query e consulta a collection, devolvendo os pontos crus do
+        Qdrant (payload completo). Núcleo compartilhado por search() e search_points()."""
+        dense_vector, lexical_weights = self._embedder.embed_query(query, normalize=False)
+        sparse_indices = [int(k) for k in lexical_weights.keys()]
+        sparse_values = [float(v) for v in lexical_weights.values()]
+
+        if type == "hybrid":
+            results = await self._client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                prefetch=[
+                    Prefetch(query=dense_vector, using="dense", limit=limit * 2),
+                    Prefetch(
+                        query=SparseVector(indices=sparse_indices, values=sparse_values),
+                        using="sparse",
+                        limit=limit * 2,
+                    ),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+        elif type == "sparse":
+            results = await self._client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=SparseVector(indices=sparse_indices, values=sparse_values),
+                using="sparse",
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+        else:  # dense
+            results = await self._client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=dense_vector,
+                using="dense",
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+        return results.points
+
     async def search(
         self,
         query: str,
@@ -156,71 +229,9 @@ class SemanticSearch:
 
         t0 = time.perf_counter()
         try:
-            dense_vector, lexical_weights = self._embedder.embed_query(query, normalize=False)
-            sparse_indices = [int(k) for k in lexical_weights.keys()]
-            sparse_values = [float(v) for v in lexical_weights.values()]
-
-            conditions = []
-            must_not: list = []
-            if uuid and uuid.strip():
-                conditions.append(FieldCondition(key="item_uuid", match=MatchValue(value=uuid.strip())))
-            if doc_id and doc_id.strip():
-                conditions.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id.strip())))
-
-            # --- Filtro por perfil de recuperação (§21) ---
-            explicit = (profile or "").strip().lower()
-            if explicit or _search_filtering_enabled():
-                resolved = explicit or (detect_query_profile(query) or SEARCH_DEFAULT_PROFILE or PROFILE_GENERAL)
-                p_must, p_must_not = _profile_conditions(resolved)
-                conditions.extend(p_must)
-                must_not.extend(p_must_not)
-                # §11: dados visuais de baixa confiança fora de QUALQUER perfil (global).
-                if SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA:
-                    must_not.append(FieldCondition(
-                        key="chart_data_confidence", range=Range(lt=CHUNK_CHART_MIN_CONFIDENCE)))
-                log_api.info("search profile=%r (resolvido de %r)", resolved, explicit or "auto")
-
-            query_filter = (
-                Filter(must=conditions or None, must_not=must_not or None)
-                if (conditions or must_not) else None
-            )
-
-            if type == "hybrid":
-                results = await self._client.query_points(
-                    collection_name=QDRANT_COLLECTION,
-                    prefetch=[
-                        Prefetch(query=dense_vector, using="dense", limit=limit * 2),
-                        Prefetch(
-                            query=SparseVector(indices=sparse_indices, values=sparse_values),
-                            using="sparse",
-                            limit=limit * 2,
-                        ),
-                    ],
-                    query=FusionQuery(fusion=Fusion.RRF),
-                    query_filter=query_filter,
-                    limit=limit,
-                    with_payload=True,
-                )
-            elif type == "sparse":
-                results = await self._client.query_points(
-                    collection_name=QDRANT_COLLECTION,
-                    query=SparseVector(indices=sparse_indices, values=sparse_values),
-                    using="sparse",
-                    query_filter=query_filter,
-                    limit=limit,
-                    with_payload=True,
-                )
-            else:  # dense
-                results = await self._client.query_points(
-                    collection_name=QDRANT_COLLECTION,
-                    query=dense_vector,
-                    using="dense",
-                    query_filter=query_filter,
-                    limit=limit,
-                    with_payload=True,
-                )
-
-            hits = [self._to_result(p) for p in results.points]
+            query_filter = self._build_query_filter(query, doc_id, uuid, profile)
+            points = await self._query_points(query, limit, type, query_filter)
+            hits = [self._to_result(p) for p in points]
             log_api.info(
                 "search semantic (%s): %d resultado(s) em %.3fs",
                 type, len(hits), time.perf_counter() - t0,
@@ -228,6 +239,26 @@ class SemanticSearch:
             return hits
         except Exception as exc:
             log_api.error("Erro na busca semântica: %s", exc)
+            return []
+
+    async def search_points(
+        self, query: str, limit: int = 10, type: str = "hybrid", profile: str = "",
+    ) -> list:
+        """Como search(), mas devolve os PONTOS crus do Qdrant (payload completo).
+
+        Usado pelo SummaryService para montar evidências numeradas + mappings
+        (chunk_id/document_id/item_uuid), que o SearchResult (7 campos) não expõe.
+        Read-only e aditivo: não altera search() nem o contrato da busca.
+        """
+        if not await self.ensure_connected():
+            return []
+        if not query or not query.strip():
+            return []
+        try:
+            query_filter = self._build_query_filter(query, None, None, profile)
+            return await self._query_points(query, limit, type, query_filter)
+        except Exception as exc:
+            log_api.error("Erro no retrieval do summary: %s", exc)
             return []
 
     @staticmethod
