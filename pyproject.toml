@@ -44,6 +44,9 @@ dependencies = [
 # workspace. `uv sync` a instala em modo editável automaticamente.
 [tool.uv.workspace]
 members = ["packages/*"]
+# experiments/ é um projeto uv independente (venv e lock próprios) e não é
+# versionado. Excluído explicitamente para o uv não o anexar ao workspace.
+exclude = ["experiments"]
 
 [tool.uv.sources]
 gpu-resource-manager = { workspace = true }

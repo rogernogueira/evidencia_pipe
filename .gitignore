@@ -18,6 +18,8 @@ wheels/
 data/
 output/
 qdrant_storage/
+# Sandbox de experimentos: projeto uv independente (venv/lock próprios), fora do repo.
+experiments/
 
 # Área de build/scratch: versiona só o Dockerfile do MinerU, ignora o resto (logs, runs).
 tmp/*
