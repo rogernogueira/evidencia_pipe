@@ -46,7 +46,10 @@ uv --version                     # gerenciador de deps (Python 3.13+)
 python3 --version
 ```
 
-O compose usa **CDI** para a GPU nos serviços vLLM (`devices: nvidia.com/gpu=all`).
+O compose usa **CDI** para a GPU em todos os serviços de GPU — MinerU e vLLM
+(`devices: nvidia.com/gpu=all`). Não troque por `deploy.resources`/`--gpus all`: com
+cgroup v2 + driver systemd, um `systemctl daemon-reload` faz o contêiner perder a GPU
+em runtime (`Failed to initialize NVML: Unknown Error`) sem o `/health` acusar.
 Confirme que o device existe antes de continuar:
 
 ```bash

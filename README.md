@@ -207,7 +207,7 @@ uv run python backend/main.py                        # sobe em http://127.0.0.1:
 > argumentos sobe só a infra leve. Nomeá-los explicitamente (como acima) ativa o profile
 > sozinho; para subir tudo de uma vez, `docker compose --profile gpu up -d`.
 
-O `docker-compose.yml` define **dois** serviços MinerU (imagem única `evidencia_mineru:local`, de `tmp/Dockerfile`, base vLLM). Ambos exigem **`--gpus all`** (com device único o vLLM falha com `Device string must not be empty`). Numa GPU única, rode **um ou outro** — juntos estouram a VRAM.
+O `docker-compose.yml` define **dois** serviços MinerU (imagem única `evidencia_mineru:local`, de `tmp/Dockerfile`, base vLLM). Ambos exigem **todas as GPUs**, via CDI (`nvidia.com/gpu=all`, equivalente ao `--gpus all`; com device único o vLLM falha com `Device string must not be empty`). Numa GPU única, rode **um ou outro** — juntos estouram a VRAM.
 
 | Serviço | Porta | VLM | VRAM | Quando usar |
 |---------|-------|-----|------|-------------|

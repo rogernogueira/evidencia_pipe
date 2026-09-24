@@ -87,8 +87,18 @@ services:
 
   # Serviço de extração MinerU (estágio 2). Imagem construída de tmp/Dockerfile
   # (base vllm/vllm-openai, mineru[core]>=3.4.0). REQUER GPU com acesso a TODAS as
-  # devices (--gpus all): com device único o vLLM falha com "Device string must not
-  # be empty". A porta 8011 evita conflito com serviços MinerU legados na 8010.
+  # devices (`nvidia.com/gpu=all`, equivalente ao --gpus all): com device único o
+  # vLLM falha com "Device string must not be empty". A porta 8011 evita conflito
+  # com serviços MinerU legados na 8010.
+  #
+  # GPU via CDI, NÃO via `deploy.resources` (hook do nvidia-container-runtime):
+  # com cgroup v2 + driver systemd, um `systemctl daemon-reload` no host apaga as
+  # regras de device que o hook injetou, e o contêiner perde a GPU em runtime
+  # (`Failed to initialize NVML: Unknown Error`) com o /health ainda "healthy" —
+  # aconteceu em 09/2026: duas semanas de extrações falhando. Com CDI os devices
+  # fazem parte da spec do contêiner e sobrevivem ao reload (o vllm-bge-m3, que já
+  # usava CDI, não caiu). A spec fica em /var/run/cdi e é regenerada no boot pelo
+  # nvidia-cdi-refresh.service.
   # Os workers no HOST apontam MINERU_API_URL=http://127.0.0.1:8011.
   mineru:
     profiles: ["gpu"]
@@ -101,13 +111,9 @@ services:
       MINERU_MODEL_SOURCE: local
     ports:
       - "8011:8010"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: ["gpu"]
+    # GPU via CDI, como o vllm-bge-m3 (ver comentário do serviço `mineru`).
+    devices:
+      - nvidia.com/gpu=all
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
       interval: 15s
@@ -133,13 +139,9 @@ services:
       MINERU_MODEL_SOURCE: local
     ports:
       - "8012:8010"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: ["gpu"]
+    # GPU via CDI, como o vllm-bge-m3 (ver comentário do serviço `mineru`).
+    devices:
+      - nvidia.com/gpu=all
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
       interval: 15s
@@ -161,7 +163,7 @@ services:
   #   docker compose --profile mineru-v4 up -d mineru-v4
   #   docker compose --profile mineru-v4 down mineru-v4
   #
-  # Como a de produção, exige --gpus all (count: all): com device único o vLLM falha
+  # Como a de produção, exige todas as GPUs (CDI nvidia.com/gpu=all): com device único o vLLM falha
   # com "Device string must not be empty".
   mineru-v4:
     profiles: ["mineru-v4"]
@@ -179,13 +181,9 @@ services:
       MINERU_MODEL_SOURCE: local
     ports:
       - "8013:8010"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: ["gpu"]
+    # GPU via CDI, como o vllm-bge-m3 (ver comentário do serviço `mineru`).
+    devices:
+      - nvidia.com/gpu=all
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
       interval: 15s
