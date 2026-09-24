@@ -242,20 +242,29 @@ class SemanticSearch:
             return []
 
     async def search_points(
-        self, query: str, limit: int = 10, type: str = "hybrid", profile: str = "",
+        self,
+        query: str,
+        limit: int = 10,
+        type: str = "hybrid",
+        profile: str = "",
+        uuid: Optional[str] = None,
     ) -> list:
         """Como search(), mas devolve os PONTOS crus do Qdrant (payload completo).
 
         Usado pelo SummaryService para montar evidências numeradas + mappings
         (chunk_id/document_id/item_uuid), que o SearchResult (7 campos) não expõe.
         Read-only e aditivo: não altera search() nem o contrato da busca.
+
+        `uuid` restringe a consulta a um item do DSpace (payload.item_uuid) — é como o
+        summary faz uma recuperação independente por documento, cada chamada trazendo
+        seus próprios `limit` chunks.
         """
         if not await self.ensure_connected():
             return []
         if not query or not query.strip():
             return []
         try:
-            query_filter = self._build_query_filter(query, None, None, profile)
+            query_filter = self._build_query_filter(query, None, uuid, profile)
             return await self._query_points(query, limit, type, query_filter)
         except Exception as exc:
             log_api.error("Erro no retrieval do summary: %s", exc)

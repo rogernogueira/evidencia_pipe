@@ -222,8 +222,8 @@ LLM_ENRICH_REVIEW_THRESHOLD = float(
 LLM_ENRICH_AUTO = (os.getenv("LLM_ENRICH_AUTO", "true").strip().lower() in {"1", "true", "yes", "on"})
 
 # --------------------------------------------------------------------------
-# AI Summary (GET /api/search/summarize) — usa a MESMA config de LLM do enrich, com
-# dois pontos próprios: o modelo e o "thinking".
+# AI Summary (GET e POST /api/search/summarize) — usa a MESMA config de LLM do enrich,
+# com dois pontos próprios: o modelo e o "thinking".
 #
 # O resumo é texto livre, e é aí que modelo de raciocínio atrapalha: o rascunho vaza
 # no `content` (um `</think>` órfão seguido de texto em chinês — o modelo raciocina no
@@ -247,6 +247,12 @@ LLM_SUMMARY_DISABLE_THINKING = (
 # Modelo do resumo. Por padrão o mesmo do enrich; separado para permitir usar no
 # resumo um modelo diferente do da extração de metadados, sem duplicar config.
 LLM_SUMMARY_MODEL = (os.getenv("LLM_SUMMARY_MODEL") or LLM_ENRICH_MODEL).strip()
+
+# Teto de documentos no POST /api/search/summarize. Cada documento da lista vira uma
+# consulta INDEPENDENTE ao Qdrant dentro de UMA requisição síncrona, com o usuário
+# esperando: sem teto, uma lista grande vira latência na resposta e carga no Qdrant.
+# Acima disto a requisição é recusada com 422 antes de qualquer retrieval.
+SUMMARY_MAX_DOCUMENTS = int(os.getenv("SUMMARY_MAX_DOCUMENTS", "20"))
 
 # Aliases legados (compatibilidade com imports/código existente).
 DEEPSEEK_API_KEY = LLM_ENRICH_API_KEY

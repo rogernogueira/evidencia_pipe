@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.core.config import SUMMARY_MAX_DOCUMENTS
+
 class ChunkMetadata(BaseModel):
     """Metadados que acompanham cada chunk semântico extraído pelo MinerU."""
     page: int = Field(..., description="Número da página onde o texto foi extraído")
@@ -46,7 +48,7 @@ class SearchResult(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# AI Summary (GET /api/search/summarize) — síntese das evidências recuperadas.
+# AI Summary (GET e POST /api/search/summarize) — síntese das evidências recuperadas.
 # Modelos ADITIVOS: não alteram SearchResult (contrato de 7 campos consumido pelo
 # Angular do DSpace). Nesta 1ª iteração não há filtros de metadados nem grupo
 # Centralised/Decentralised — ver decisão de escopo.
@@ -66,12 +68,58 @@ class EvidenceMapping(BaseModel):
     snippet: str = Field("", description="Trecho do chunk usado como evidência")
 
 
+class DocumentRef(BaseModel):
+    """Referência a um item do DSpace para recuperação por documento.
+
+    O `uuid` é o que filtra de fato (payload.item_uuid no Qdrant); o `handle` vem
+    junto por conveniência do cliente e é ecoado em `applied_filters`, sem participar
+    da consulta."""
+    uuid: str = Field(..., min_length=1, description="UUID do item DSpace (item_uuid)")
+    handle: Optional[str] = Field(None, description="Handle do item DSpace (informativo)")
+
+
+class SummarizeRequest(BaseModel):
+    """Corpo do POST /api/search/summarize — mesmos parâmetros do GET mais a lista
+    `documents`.
+
+    Com `documents` vazia (ou ausente) vale a regra do GET: uma única recuperação
+    global de `limit` chunks. Com `documents` preenchida há uma recuperação
+    INDEPENDENTE por UUID, cada uma devolvendo até `limit` chunks (o k por documento),
+    e as evidências são a concatenação dos resultados na ordem em que os documentos
+    foram enviados.
+
+    A lista é limitada a SUMMARY_MAX_DOCUMENTS: são N consultas ao Qdrant numa
+    requisição síncrona, e o teto é rejeitado na validação, antes de qualquer
+    retrieval."""
+    q: str = Field(..., min_length=1, description="Consulta para a síntese das evidências")
+    limit: int = Field(
+        5, ge=1, le=20,
+        description="Máx. de chunks recuperados — total, ou por documento quando há `documents`",
+    )
+    type: str = Field("hybrid", description="Modo: 'hybrid' (RRF), 'dense' ou 'sparse'")
+    language: str = Field("pt-BR", description="Idioma da síntese")
+    documents: list[DocumentRef] = Field(
+        default_factory=list,
+        max_length=SUMMARY_MAX_DOCUMENTS,
+        description=(
+            f"Itens do DSpace a consultar um a um (máx. {SUMMARY_MAX_DOCUMENTS}); "
+            "vazia = busca global (regra atual)"
+        ),
+    )
+
+
 class RetrievalMetadata(BaseModel):
     """Parâmetros do retrieval que originou as evidências — transparência do contrato."""
     type: str = Field("hybrid", description="Modo do retrieval: hybrid | dense | sparse")
     fusion: Optional[str] = Field(None, description="Fusão no modo híbrido (rrf)")
     top: int = Field(0, description="Máximo de chunks solicitados ao índice")
     evidence_count: int = Field(0, description="Nº de evidências após deduplicação")
+    per_document: bool = Field(
+        False, description="True quando houve uma recuperação independente por documento"
+    )
+    documents_count: int = Field(
+        0, description="Nº de documentos consultados independentemente (0 = busca global)"
+    )
 
 
 class SummaryResponse(BaseModel):
@@ -82,7 +130,7 @@ class SummaryResponse(BaseModel):
     language: str = Field("pt-BR", description="Idioma da síntese")
     applied_filters: dict[str, Any] = Field(
         default_factory=dict,
-        description="Filtros de metadados aplicados (vazio nesta iteração)",
+        description="Filtros aplicados: {'documents': [...]} na recuperação por documento; vazio na busca global",
     )
     retrieval: RetrievalMetadata = Field(..., description="Parâmetros do retrieval")
     summary: str = Field("", description="Texto sintetizado, com citações [N]")

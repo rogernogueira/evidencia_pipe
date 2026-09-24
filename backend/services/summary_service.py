@@ -2,7 +2,8 @@
 
 Orquestra, fora de routes/search.py, as responsabilidades do resumo:
   1. receber query e (futuramente) filtros;
-  2. chamar SemanticSearch.search_points (retrieval híbrido/dense/sparse já existente);
+  2. chamar SemanticSearch.search_points (retrieval híbrido/dense/sparse já existente)
+     — uma vez, globalmente, ou uma vez POR DOCUMENTO quando o cliente envia `documents`;
   3. deduplicar (document_id + página + hash) com teto de chunks por documento;
   4. montar evidências numeradas;
   5. chamar o LLM (endpoint OpenAI-compatible, mesma config do enrich);
@@ -15,11 +16,12 @@ threadpool (run_in_threadpool) para NÃO bloquear o event loop do FastAPI — a 
 pública compartilha o mesmo processo uvicorn.
 """
 
+import asyncio
 import hashlib
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 from fastapi.concurrency import run_in_threadpool
 from openai import BadRequestError, OpenAI, UnprocessableEntityError
@@ -32,7 +34,12 @@ from backend.core.config import (
     LLM_SUMMARY_MODEL,
 )
 from backend.core.logger import log_api
-from backend.core.schemas import EvidenceMapping, RetrievalMetadata, SummaryResponse
+from backend.core.schemas import (
+    DocumentRef,
+    EvidenceMapping,
+    RetrievalMetadata,
+    SummaryResponse,
+)
 from backend.repositories.qdrant_client import SemanticSearch
 from backend.services import llm_enrich_service
 from backend.services.summary_prompts import (
@@ -43,6 +50,9 @@ from backend.services.summary_prompts import (
 
 # Diversidade documental: teto de chunks por documento nas evidências, evitando
 # um top-N em que quase todos os trechos venham do mesmo PDF (§10 do plano).
+# NÃO se aplica à recuperação por documento (`documents` na requisição): ali o cliente
+# já escolheu os documentos, e o teto por documento é o próprio `limit` (o k) de cada
+# consulta — cortar em 2 tornaria k>2 inócuo.
 MAX_CHUNKS_PER_DOCUMENT = 2
 # Tamanho do trecho devolvido em cada mapping (a evidência integral vai só ao LLM).
 SNIPPET_MAX_CHARS = 400
@@ -134,9 +144,15 @@ def _fields(point) -> dict:
     }
 
 
-def _dedup_and_number(points: list) -> list[_Evidence]:
+def _dedup_and_number(
+    points: list, max_per_document: Optional[int] = MAX_CHUNKS_PER_DOCUMENT
+) -> list[_Evidence]:
     """Deduplica por (document_id, página, hash do texto) e limita chunks por
-    documento; numera as evidências restantes a partir de 1."""
+    documento; numera as evidências restantes a partir de 1.
+
+    `max_per_document=None` desliga o teto de diversidade — é o caso da recuperação
+    por documento, em que cada documento já veio de uma consulta própria com o seu
+    próprio limite. O dedup exato continua valendo nos dois casos."""
     seen: set = set()
     per_doc: dict = {}
     evidences: list[_Evidence] = []
@@ -150,12 +166,29 @@ def _dedup_and_number(points: list) -> list[_Evidence]:
         if key in seen:
             continue
         doc = f["document_id"]
-        if per_doc.get(doc, 0) >= MAX_CHUNKS_PER_DOCUMENT:
+        if max_per_document is not None and per_doc.get(doc, 0) >= max_per_document:
             continue
         seen.add(key)
         per_doc[doc] = per_doc.get(doc, 0) + 1
         evidences.append(_Evidence(index=len(evidences) + 1, **f))
     return evidences
+
+
+def _unique_documents(documents: Optional[Iterable[DocumentRef]]) -> list[DocumentRef]:
+    """Normaliza a lista recebida: descarta UUID em branco e repetido, preservando a
+    ordem em que o cliente enviou (que é a ordem das evidências na resposta).
+
+    Um UUID repetido produziria duas consultas idênticas e evidências duplicadas —
+    o dedup por texto as removeria, mas o custo do retrieval já teria sido pago."""
+    vistos: set = set()
+    saida: list[DocumentRef] = []
+    for d in documents or []:
+        uuid = (d.uuid or "").strip()
+        if not uuid or uuid in vistos:
+            continue
+        vistos.add(uuid)
+        saida.append(DocumentRef(uuid=uuid, handle=d.handle))
+    return saida
 
 
 def _evidence_block(evidences: list[_Evidence]) -> str:
@@ -289,23 +322,84 @@ class SummaryService:
         """True se há chave de LLM configurada (mesma do enrich)."""
         return llm_enrich_service.is_available()
 
+    async def _retrieve_per_document(
+        self, query: str, documents: Sequence[DocumentRef], *, limit: int, type: str,
+    ) -> list:
+        """Uma recuperação INDEPENDENTE por documento: cada UUID vira uma consulta
+        própria ao Qdrant (filtro item_uuid) com o seu próprio teto de `limit` chunks.
+
+        As consultas vão em paralelo (o gargalo é a ida ao Qdrant, não a CPU), mas os
+        pontos são concatenados na ORDEM em que os documentos foram enviados — assim a
+        numeração [N] das evidências fica agrupada por documento e estável entre
+        chamadas iguais. `search_points` já absorve os seus próprios erros devolvendo
+        lista vazia; `return_exceptions` cobre o que escapar, para um documento
+        problemático não derrubar a síntese dos demais."""
+        resultados = await asyncio.gather(
+            *(
+                self._semantic.search_points(query, limit=limit, type=type, uuid=d.uuid)
+                for d in documents
+            ),
+            return_exceptions=True,
+        )
+        points: list = []
+        for doc, res in zip(documents, resultados):
+            if isinstance(res, BaseException):
+                log_api.error(
+                    "summarize: retrieval do documento %s falhou (%s) — seguindo sem ele.",
+                    doc.uuid, res,
+                )
+                continue
+            if not res:
+                log_api.info("summarize: documento %s sem chunks para q=%r", doc.uuid, query)
+            points.extend(res)
+        return points
+
     async def summarize(
-        self, query: str, *, limit: int = 5, type: str = "hybrid", language: str = "pt-BR",
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        type: str = "hybrid",
+        language: str = "pt-BR",
+        documents: Optional[Sequence[DocumentRef]] = None,
     ) -> SummaryResponse:
         """Sintetiza as evidências recuperadas para `query`. Retrieval assíncrono +
-        LLM em threadpool. Sem evidências → resposta com summary vazio (sem chamar o LLM)."""
-        points = await self._semantic.search_points(query, limit=limit, type=type)
-        evidences = _dedup_and_number(points)
+        LLM em threadpool. Sem evidências → resposta com summary vazio (sem chamar o LLM).
+
+        `documents` vazia (o padrão, e o único caso do GET): uma recuperação global de
+        até `limit` chunks, com o teto de diversidade por documento — regra original,
+        inalterada. `documents` preenchida: uma recuperação por UUID, cada uma trazendo
+        até `limit` chunks (o k por documento), sem o teto de diversidade; a síntese é
+        uma só, sobre a união das evidências."""
+        docs = _unique_documents(documents)
+        if docs:
+            points = await self._retrieve_per_document(query, docs, limit=limit, type=type)
+            # O cliente escolheu os documentos: o teto de diversidade sai de cena e cada
+            # documento contribui com até os `limit` chunks que a sua consulta trouxe.
+            evidences = _dedup_and_number(points, max_per_document=None)
+            applied_filters = {
+                "documents": [d.model_dump(exclude_none=True) for d in docs],
+            }
+        else:
+            points = await self._semantic.search_points(query, limit=limit, type=type)
+            evidences = _dedup_and_number(points)
+            applied_filters = {}
+
         retrieval = RetrievalMetadata(
             type=type,
             fusion="rrf" if type == "hybrid" else None,
             top=limit,
             evidence_count=len(evidences),
+            per_document=bool(docs),
+            documents_count=len(docs),
         )
         if not evidences:
-            log_api.info("summarize q=%r: 0 evidência(s) — sem chamada ao LLM", query)
+            log_api.info(
+                "summarize q=%r documentos=%d: 0 evidência(s) — sem chamada ao LLM",
+                query, len(docs),
+            )
             return SummaryResponse(
-                query=query, language=language, applied_filters={},
+                query=query, language=language, applied_filters=applied_filters,
                 retrieval=retrieval, summary="", mappings=[],
             )
 
@@ -339,7 +433,8 @@ class SummaryService:
                 )
 
         log_api.info(
-            "summarize q=%r evidências=%d em %.3fs", query, len(evidences), time.perf_counter() - t0,
+            "summarize q=%r documentos=%d evidências=%d em %.3fs",
+            query, len(docs), len(evidences), time.perf_counter() - t0,
         )
 
         mappings = [
@@ -352,6 +447,6 @@ class SummaryService:
             for e in evidences
         ]
         return SummaryResponse(
-            query=query, language=language, applied_filters={},
+            query=query, language=language, applied_filters=applied_filters,
             retrieval=retrieval, summary=summary, mappings=mappings,
         )

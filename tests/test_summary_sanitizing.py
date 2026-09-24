@@ -165,7 +165,7 @@ class _Ponto:
 
 
 class _SemanticFake:
-    async def search_points(self, query, limit=5, type="hybrid"):
+    async def search_points(self, query, limit=5, type="hybrid", profile="", uuid=None):
         return [_Ponto(1), _Ponto(2)]
 
 
