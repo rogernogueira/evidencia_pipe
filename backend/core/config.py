@@ -254,6 +254,22 @@ LLM_SUMMARY_MODEL = (os.getenv("LLM_SUMMARY_MODEL") or LLM_ENRICH_MODEL).strip()
 # Acima disto a requisição é recusada com 422 antes de qualquer retrieval.
 SUMMARY_MAX_DOCUMENTS = int(os.getenv("SUMMARY_MAX_DOCUMENTS", "20"))
 
+# Cache do AI Summary (ver backend/services/summary_cache.py). A síntese custa uma ou
+# duas chamadas ao LLM com o usuário esperando, e a mesma pergunta se repete muito na
+# busca pública. Guarda a SummaryResponse inteira no Redis (DB do job_store, prefixo
+# `summary:`), com fallback em memória por processo se o Redis cair.
+#
+# A chave inclui a GERAÇÃO do índice, que a indexação incrementa a cada escrita no
+# Qdrant: reindexar um documento invalida tudo de uma vez. O TTL é só o teto para o
+# que a geração não enxerga (troca de provedor, Redis indisponível para o worker).
+SUMMARY_CACHE_ENABLED = (
+    os.getenv("SUMMARY_CACHE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+)
+SUMMARY_CACHE_TTL_SECONDS = int(os.getenv("SUMMARY_CACHE_TTL_SECONDS", str(24 * 3600)))
+SUMMARY_CACHE_REDIS_URL = os.getenv("SUMMARY_CACHE_REDIS_URL") or JOBSTORE_REDIS_URL
+# Teto de entradas do fallback em memória (LRU) — o Redis não tem teto próprio aqui.
+SUMMARY_CACHE_MAX_ENTRIES = int(os.getenv("SUMMARY_CACHE_MAX_ENTRIES", "256"))
+
 # Aliases legados (compatibilidade com imports/código existente).
 DEEPSEEK_API_KEY = LLM_ENRICH_API_KEY
 DEEPSEEK_BASE_URL = LLM_ENRICH_BASE_URL

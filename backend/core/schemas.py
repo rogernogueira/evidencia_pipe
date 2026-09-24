@@ -137,6 +137,10 @@ class SummaryResponse(BaseModel):
     mappings: list[EvidenceMapping] = Field(
         default_factory=list, description="Origem de cada evidência numerada"
     )
+    cached: bool = Field(
+        False,
+        description="True quando a síntese veio do cache (ou de uma requisição idêntica simultânea), sem nova chamada ao LLM",
+    )
 
 
 class LlmMetadataCandidates(BaseModel):

@@ -42,6 +42,7 @@ from backend.core.schemas import (
 )
 from backend.repositories.qdrant_client import SemanticSearch
 from backend.services import llm_enrich_service
+from backend.services.summary_cache import SummaryCache
 from backend.services.summary_prompts import (
     BASIC_SUMMARY_SYSTEM_PROMPT,
     OUTPUT_ONLY_REMINDER,
@@ -314,8 +315,14 @@ class SummaryService:
     """Serviço do AI Summary. Reusa o SemanticSearch residente (mesmo embedder e
     cliente Qdrant da busca) e um cliente LLM OpenAI-compatible."""
 
-    def __init__(self, semantic: SemanticSearch):
+    def __init__(self, semantic: SemanticSearch, cache: Optional[SummaryCache] = None):
         self._semantic = semantic
+        # Sem cache (None) cada chamada recupera e sintetiza do zero — o padrão dos
+        # testes; a API injeta um SummaryCache em dependencies.py.
+        self._cache = cache
+        # Single-flight: requisições idênticas simultâneas esperam a mesma síntese em
+        # vez de pagar uma chamada ao LLM cada uma (chave → tarefa em andamento).
+        self._inflight: dict[str, asyncio.Task] = {}
 
     @staticmethod
     def llm_available() -> bool:
@@ -355,6 +362,65 @@ class SummaryService:
         return points
 
     async def summarize(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        type: str = "hybrid",
+        language: str = "pt-BR",
+        documents: Optional[Sequence[DocumentRef]] = None,
+    ) -> SummaryResponse:
+        """Síntese com cache (ver summary_cache.py): hit devolve a resposta guardada
+        sem retrieval nem LLM; miss sintetiza e guarda. Só entra no cache síntese
+        aproveitável — vazia (sem evidências, ou o saneamento consumiu tudo) ou ainda
+        contaminada fica de fora, para a próxima requisição tentar de novo.
+
+        A síntese do miss roda numa tarefa própria: se o cliente desconectar, ela
+        termina e é guardada mesmo assim, e quem chegou junto com a mesma pergunta
+        recebe o mesmo resultado."""
+        if self._cache is None:
+            return await self._summarize(
+                query, limit=limit, type=type, language=language, documents=documents,
+            )
+        docs = _unique_documents(documents)
+        key = await run_in_threadpool(
+            self._cache.key, query, limit=limit, type=type, language=language, documents=docs,
+        )
+        hit = await run_in_threadpool(self._cache.get, key)
+        if hit is not None:
+            log_api.info("summarize q=%r documentos=%d: cache hit", query, len(docs))
+            return hit.model_copy(update={"query": query, "cached": True})
+
+        task = self._inflight.get(key)
+        if task is not None:
+            log_api.info("summarize q=%r: aguardando síntese idêntica em andamento", query)
+            resp = await asyncio.shield(task)
+            return resp.model_copy(update={"query": query, "cached": True})
+
+        task = asyncio.create_task(
+            self._summarize_and_store(key, query, limit, type, language, docs)
+        )
+        self._inflight[key] = task
+        return await asyncio.shield(task)
+
+    async def _summarize_and_store(
+        self, key: str, query: str, limit: int, type: str, language: str,
+        docs: Sequence[DocumentRef],
+    ) -> SummaryResponse:
+        try:
+            resp = await self._summarize(
+                query, limit=limit, type=type, language=language, documents=docs,
+            )
+            if resp.summary and not _contaminado(resp.summary, language):
+                try:
+                    await run_in_threadpool(self._cache.set, key, resp)
+                except Exception as exc:  # cache é otimização: nunca vira erro
+                    log_api.warning("summarize: falha ao gravar no cache (%s)", exc)
+            return resp
+        finally:
+            self._inflight.pop(key, None)
+
+    async def _summarize(
         self,
         query: str,
         *,

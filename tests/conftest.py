@@ -46,3 +46,13 @@ def gpu_manager_fake(monkeypatch):
     # expõe a fábrica p/ criar "outros processos" no mesmo fakeredis
     primary._make_peer = make  # type: ignore[attr-defined]
     return primary
+
+
+@pytest.fixture(autouse=True)
+def _summary_cache_isolado(monkeypatch):
+    """Nenhum teste toca o Redis real pelo cache do AI Summary: a indexação chama
+    bump_index_generation(), e sem isto cada rodada da suíte invalidaria o cache de
+    quem estiver com a API no ar."""
+    import backend.services.summary_cache as sc
+
+    monkeypatch.setattr(sc, "_redis", fakeredis.FakeRedis(decode_responses=True))

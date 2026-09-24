@@ -29,6 +29,7 @@ from backend.indexing.chunks import MinerUChunker
 from backend.services.embedder import BgeM3EmbedderService
 from backend.core.config import QDRANT_COLLECTION, QDRANT_TIMEOUT_SECONDS, QDRANT_URL, OUTPUT_DIR
 from backend.core.schemas import DocumentMetadata
+from backend.services.summary_cache import bump_index_generation
 
 # ---------------------------------------------------------------------------
 # Config
@@ -178,6 +179,7 @@ def setup_collection(client: QdrantClient, reset: bool, dense_dim: int) -> None:
         print(f"  ♻️  Recriando collection '{COLLECTION_NAME}'...")
         log.info("Collection existe e --reset foi informado. Recriando collection.")
         client.delete_collection(COLLECTION_NAME)
+        bump_index_generation()  # sínteses em cache citam pontos que deixaram de existir
         exists = False
 
     if not exists:
@@ -367,6 +369,7 @@ def index_document(
     for start in range(0, len(points), batch):
         client.upsert(collection_name=COLLECTION_NAME, points=points[start:start + batch])
     upsert_time_s = time.perf_counter() - t_upsert
+    bump_index_generation()  # o índice mudou: invalida as sínteses em cache
     total_time_s  = time.perf_counter() - t_total
     log.info("Upsert concluido para '%s' em %.3fs (%d ponto(s), batch=%d).", doc_id, upsert_time_s, len(points), batch)
 
@@ -663,6 +666,8 @@ def _index_structural_document(
         )
     except Exception as exc:
         log.warning("[index] limpeza de versões antigas de '%s' falhou (best-effort): %s", doc_name, exc)
+    # Depois do upsert E da limpeza: o índice mudou, as sínteses em cache ficam velhas.
+    bump_index_generation()
 
     total_time_s = time.perf_counter() - t_total
     log.info("[index] '%s' indexado: %d ponto(s), embed=%.2fs upsert=%.2fs.", doc_id, len(points), embed_time_s, upsert_time_s)
