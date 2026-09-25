@@ -84,8 +84,24 @@ class PipelineTask(app.Task):
         job_id = _job_id_of(args, kwargs)
         if job_id:
             stage = self.name.rsplit(".", 1)[-1]
-            set_status(job_id, "erro", stage=stage, error=f"{type(exc).__name__}: {exc}")
+            extra = {"stage": stage}
+            # Exceções que não sobrevivem ao pickle do Celery (ex.: urllib HTTPError)
+            # chegam aqui como um OSError() vazio — não sobrescreve o `error` que a
+            # task já gravou com uma mensagem útil.
+            if str(exc):
+                extra["error"] = f"{type(exc).__name__}: {exc}"
+            set_status(job_id, "erro", **extra)
             add_failed(job_id)  # entra na fila de falhas (reprocessável)
+
+
+class DSpaceDownloadError(RuntimeError):
+    """Falha definitiva do download de um bitstream. Carrega só a mensagem (str), para
+    sobreviver à serialização do Celery — o HTTPError original não sobrevive."""
+
+
+# Respostas do DSpace que indicam bitstream inacessível ao acesso anônimo (restrito,
+# em workflow/embargo) ou inexistente: repetir o download em segundos não resolve.
+_DSPACE_UNAVAILABLE_CODES = frozenset({401, 403, 404, 410})
 
 
 # --------------------------------------------------------------------------
@@ -143,6 +159,16 @@ def resolver_item_dspace(self, item_uuid, force=False, attempt=1):
 # --------------------------------------------------------------------------
 # Estágio 1 — download do bitstream (fila: download)
 # --------------------------------------------------------------------------
+def _retry_or_fail(task, job_id, exc, msg):
+    """Erro transiente: reagenda (backoff do Celery). Esgotadas as tentativas, grava a
+    mensagem no job e levanta DSpaceDownloadError — `retry(exc=...)` relançaria o
+    próprio HTTPError, que o Celery não consegue serializar."""
+    if task.request.retries < task.max_retries:
+        raise task.retry(exc=exc)
+    set_status(job_id, "erro", stage="download", error=msg)
+    raise DSpaceDownloadError(msg) from exc
+
+
 @app.task(bind=True, base=PipelineTask, max_retries=3, default_retry_delay=15)
 def baixar_dspace(self, bs_uuid, filename, job_id, item_uuid="", item_handle="", force=False):
     set_status(
@@ -155,12 +181,17 @@ def baixar_dspace(self, bs_uuid, filename, job_id, item_uuid="", item_handle="",
             bs_uuid=bs_uuid, filename=filename, job_id=job_id,
             item_uuid=item_uuid, item_handle=item_handle, force=force,
         )
-    except (urllib.error.HTTPError, urllib.error.URLError) as e:
-        try:
-            raise self.retry(exc=e)  # transiente → backoff/retry
-        except self.MaxRetriesExceededError:
-            set_status(job_id, "erro", stage="download", error=f"download falhou: {e}")
-            raise
+    except urllib.error.HTTPError as e:
+        if e.code in _DSPACE_UNAVAILABLE_CODES:
+            msg = (
+                f"bitstream {bs_uuid} indisponível no DSpace (HTTP {e.code}): restrito, "
+                f"em workflow/embargo ou inexistente — {e.url}"
+            )
+            set_status(job_id, "erro", stage="download", error=msg)
+            raise DSpaceDownloadError(msg) from e
+        _retry_or_fail(self, job_id, e, f"download falhou (HTTP {e.code}): {e.url}")
+    except urllib.error.URLError as e:
+        _retry_or_fail(self, job_id, e, f"download falhou: {e.reason}")
     except ValueError as e:  # conteúdo não é PDF → retry não ajuda
         set_status(job_id, "erro", stage="download", error=str(e))
         raise
