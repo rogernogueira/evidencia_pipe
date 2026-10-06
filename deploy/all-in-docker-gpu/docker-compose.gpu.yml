@@ -1,0 +1,232 @@
+# ESBOÇO — stack TUDO-EM-DOCKER com GPU LOCAL. Diferente do modelo híbrido de hoje
+# (infra+inferência em contêiner, mas API/workers no venv/systemd do host), aqui
+# TUDO é contêiner: infra, inferência de GPU, Qdrant E a aplicação.
+#
+#   infra:      redis, flower, minio(+init), qdrant
+#   inferência: mineru-pipeline (GPU), vllm-bge-m3 + -sparse (GPU)
+#   app:        api, worker-light, worker-index  (imagem evidencia_pipe_app:local)
+#
+# Rodar (a partir deste diretório):
+#   docker compose -f docker-compose.gpu.yml build          # ou reusa imagens já locais
+#   docker compose -f docker-compose.gpu.yml up -d
+#
+# Pré-requisitos do host: GPU NVIDIA + nvidia-container-toolkit + CDI gerado
+# (nvidia-ctk cdi generate). As 3 inferências usam `devices: nvidia.com/gpu=all`.
+# Os serviços de GPU são o docker-compose.yml da RAIZ adaptados para a rede do
+# compose (sem network_mode: host) — assim os contêineres da app os acham por nome.
+name: evidencia-pipe-gpu
+
+x-app-env: &app-env
+  env_file:
+    - ../../.env
+    - ./env.gpu
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0
+    command: ["celery", "--broker=redis://redis:6379/0", "flower", "--port=5555"]
+    environment:
+      FLOWER_UNAUTHENTICATED_API: "true"
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-evidencia-pipe}
+      MINIO_BUCKET_VERSIONING: ${MINIO_BUCKET_VERSIONING:-true}
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb --ignore-existing local/\"$$MINIO_BUCKET\";
+      mc anonymous set none local/\"$$MINIO_BUCKET\";
+      if [ \"$$MINIO_BUCKET_VERSIONING\" = \"true\" ]; then mc version enable local/\"$$MINIO_BUCKET\"; fi;
+      echo 'bucket pronto';
+      "
+    restart: "no"
+
+  qdrant:
+    image: qdrant/qdrant:v1.17.1
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---- Inferência de GPU (do compose da raiz, adaptada à rede do compose) ------
+  # MinerU backend pipeline (VRAM baixa). Para VLM, use um serviço `mineru` sem
+  # --enable-vlm-preload false e aponte MINERU_BACKEND=hybrid-engine no env.gpu.
+  mineru-pipeline:
+    build:
+      context: ../../tmp
+    image: evidencia_mineru:local
+    command: ["mineru-api", "--host", "0.0.0.0", "--port", "8010", "--enable-vlm-preload", "false"]
+    environment:
+      MINERU_MODEL_SOURCE: local
+    devices:
+      - nvidia.com/gpu=all          # GPU via CDI (ver comentários no compose da raiz)
+    ports:
+      - "127.0.0.1:8012:8010"       # só debug local; a app fala por mineru-pipeline:8010
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+
+  # bge-m3 denso (task embed). ipc: host dá memória compartilhada cheia ao vLLM
+  # (independe da rede). Sem network_mode: host → fica na rede do compose.
+  vllm-bge-m3:
+    build:
+      context: ../../deploy/vllm-bge-m3
+      args:
+        VLLM_VERSION: "v0.26.0"
+    image: evidencia_bge_m3:local
+    ipc: host
+    devices:
+      - nvidia.com/gpu=all
+    command: >
+      --model ${EMBED_MODEL:-BAAI/bge-m3}
+      --served-model-name ${EMBED_API_MODEL:-BAAI/bge-m3}
+      --hf-overrides '{"architectures":["BgeM3EmbeddingModel"]}'
+      --pooler-config '{"task":"embed"}'
+      --host 0.0.0.0
+      --port 8000
+      --gpu-memory-utilization ${EMBED_GPU_UTIL:-0.12}
+      --max-model-len ${EMBED_MAX_LEN:-8192}
+    ports:
+      - "127.0.0.1:8000:8000"       # debug local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    logging:
+      driver: "json-file"
+      options: {max-size: "50m", max-file: "3"}
+    restart: unless-stopped
+
+  # bge-m3 esparso (task token_classify).
+  vllm-bge-m3-sparse:
+    build:
+      context: ../../deploy/vllm-bge-m3
+      args:
+        VLLM_VERSION: "v0.26.0"
+    image: evidencia_bge_m3:local
+    ipc: host
+    devices:
+      - nvidia.com/gpu=all
+    command: >
+      --model ${EMBED_MODEL:-BAAI/bge-m3}
+      --served-model-name ${EMBED_API_MODEL:-BAAI/bge-m3}
+      --hf-overrides '{"architectures":["BgeM3EmbeddingModel"]}'
+      --pooler-config '{"task":"token_classify"}'
+      --host 0.0.0.0
+      --port 8001
+      --gpu-memory-utilization ${EMBED_GPU_UTIL:-0.12}
+      --max-model-len ${EMBED_MAX_LEN:-8192}
+    ports:
+      - "127.0.0.1:8001:8001"       # debug local
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    logging:
+      driver: "json-file"
+      options: {max-size: "50m", max-file: "3"}
+    restart: unless-stopped
+
+  # ---- Aplicação (mesma imagem do stack CPU) ----------------------------------
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/all-in-docker-cpu/Dockerfile
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["python", "backend/main.py"]
+    ports:
+      - "127.0.0.1:8020:8020"
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Filas rápidas: download, extract (chama o MinerU), llm.
+  worker-light:
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["celery", "-A", "backend.celery_app", "worker",
+              "-Q", "download,extract,llm", "-c", "4", "-E", "-n", "light@%h"]
+    depends_on:
+      api: {condition: service_started}
+      redis: {condition: service_healthy}
+      mineru-pipeline: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Fila `gpu` = indexação (embedding + upsert Qdrant). -c 1: estágio pesado serializado.
+  worker-index:
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["celery", "-A", "backend.celery_app", "worker",
+              "-Q", "gpu", "-c", "1", "-E", "-n", "index@%h"]
+    depends_on:
+      api: {condition: service_started}
+      redis: {condition: service_healthy}
+      vllm-bge-m3: {condition: service_healthy}
+      vllm-bge-m3-sparse: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  minio_data:
+  qdrant_data:
