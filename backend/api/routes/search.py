@@ -7,7 +7,7 @@
 """
 
 import time
-from typing import List
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
@@ -71,6 +71,10 @@ async def search_summarize(
     limit: int = Query(default=5, ge=1, le=20, description="Máx. de chunks recuperados"),
     type: str = Query(default="hybrid", description="Modo: 'hybrid' (RRF), 'dense' ou 'sparse'"),
     language: str = Query(default="pt-BR", description="Idioma da síntese"),
+    focus: Optional[Literal["achados", "recomendacoes", "ambas"]] = Query(
+        default=None,
+        description="Papel do 1º filtro: achados | recomendacoes | ambas (ausente = default do servidor)",
+    ),
     semantic: SemanticSearch = Depends(get_semantic_search),
     summary: SummaryService = Depends(get_summary_service),
 ):
@@ -78,8 +82,8 @@ async def search_summarize(
     com citações [N] validadas, sem inventar conteúdo. Segue o mesmo padrão da busca
     (público; 503 quando o mecanismo está indisponível)."""
     log_api.info(
-        "GET /api/search/summarize?q=%r limit=%d type=%r lang=%r [client=%s]",
-        q, limit, type, language, request.client.host if request.client else "?",
+        "GET /api/search/summarize?q=%r limit=%d type=%r lang=%r focus=%r [client=%s]",
+        q, limit, type, language, focus, request.client.host if request.client else "?",
     )
     if not await semantic.ensure_connected():
         return JSONResponse(
@@ -96,7 +100,7 @@ async def search_summarize(
             {"error": "AI Summary indisponível: LLM não configurado (LLM_ENRICH_API_KEY)."},
             status_code=503,
         )
-    return await summary.summarize(q, limit=limit, type=type, language=language)
+    return await summary.summarize(q, limit=limit, type=type, language=language, focus=focus)
 
 
 @router.post("/api/search/summarize", response_model=SummaryResponse, tags=["search"])
@@ -120,8 +124,8 @@ async def search_summarize_post(
 
     Público e com os mesmos 503 do GET (busca indisponível, LLM não configurado)."""
     log_api.info(
-        "POST /api/search/summarize q=%r limit=%d type=%r lang=%r documentos=%d [client=%s]",
-        body.q, body.limit, body.type, body.language, len(body.documents),
+        "POST /api/search/summarize q=%r limit=%d type=%r lang=%r documentos=%d focus=%r [client=%s]",
+        body.q, body.limit, body.type, body.language, len(body.documents), body.focus,
         request.client.host if request.client else "?",
     )
     if not await semantic.ensure_connected():
@@ -145,6 +149,7 @@ async def search_summarize_post(
         type=body.type,
         language=body.language,
         documents=body.documents,
+        focus=body.focus,
     )
 
 

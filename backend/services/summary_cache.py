@@ -149,16 +149,19 @@ class SummaryCache:
 
     def key(
         self, query: str, *, limit: int, type: str, language: str,
-        documents: Sequence[DocumentRef],
+        documents: Sequence[DocumentRef], roles: Optional[Sequence[str]] = None,
     ) -> str:
         """Chave da síntese. `documents` já normalizada, e na ORDEM enviada: a ordem
-        define a numeração [N]. O handle entra porque é ecoado em applied_filters."""
+        define a numeração [N]. O handle entra porque é ecoado em applied_filters.
+        `roles` (papéis do 1º filtro) entra ordenado — focos diferentes dão sínteses
+        diferentes e não podem compartilhar entrada."""
         if self._fp is None:
             self._fp = _fingerprint()
         ident = {
             "q": normalize_query(query), "limit": limit, "type": type,
             "lang": (language or "").strip(),
             "docs": [[d.uuid, d.handle] for d in documents],
+            "roles": sorted(roles) if roles else None,
             "fp": self._fp, "gen": _index_generation(),
         }
         raw = json.dumps(ident, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

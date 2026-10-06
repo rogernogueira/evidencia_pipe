@@ -32,6 +32,7 @@ from backend.core.config import (
     LLM_ENRICH_TIMEOUT_SECONDS,
     LLM_SUMMARY_DISABLE_THINKING,
     LLM_SUMMARY_MODEL,
+    SUMMARY_FINDINGS_ROLE,
     SUMMARY_ONLY_FINDINGS,
 )
 from backend.core.logger import log_api
@@ -60,6 +61,28 @@ MAX_CHUNKS_PER_DOCUMENT = 2
 SNIPPET_MAX_CHARS = 400
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
+
+# Foco do 1º filtro do resumo: cada opção da API vira um conjunto de papéis discursivos
+# (discourse_role) para o filtro no Qdrant. "ambas" = achados + recomendações.
+FOCUS_ROLES: dict[str, list[str]] = {
+    "achados": ["achado"],
+    "recomendacoes": ["recomendacao"],
+    "ambas": ["achado", "recomendacao"],
+}
+
+
+def _resolve_roles(focus: Optional[str]) -> Optional[list[str]]:
+    """Papéis discursivos do 1º filtro. `focus` explícito (achados|recomendacoes|ambas)
+    manda; sem focus, cai no default de config: SUMMARY_ONLY_FINDINGS → [SUMMARY_FINDINGS_ROLE],
+    senão None (sem filtro). Levanta ValueError para focus inválido."""
+    if focus:
+        key = focus.strip().lower()
+        if key not in FOCUS_ROLES:
+            raise ValueError(f"focus inválido: {focus!r} (use: {', '.join(FOCUS_ROLES)})")
+        return list(FOCUS_ROLES[key])
+    if SUMMARY_ONLY_FINDINGS:
+        return [SUMMARY_FINDINGS_ROLE]
+    return None
 
 # --------------------------------------------------------------------------
 # Saneamento do raciocínio ("thinking") que vaza no content.
@@ -330,28 +353,29 @@ class SummaryService:
         """True se há chave de LLM configurada (mesma do enrich)."""
         return llm_enrich_service.is_available()
 
-    async def _search_points_findings(
-        self, query: str, *, limit: int, type: str, uuid: Optional[str] = None,
+    async def _search_points_filtered(
+        self, query: str, *, limit: int, type: str, roles: Optional[Sequence[str]],
+        uuid: Optional[str] = None,
     ) -> list:
-        """Retrieval do AI Summary com o PRIMEIRO FILTRO: só chunks marcados como achado
-        (payload exp_discourse_role='achado'). Se o filtro não trouxer nada — documento
-        não rotulado, já que a marcação ainda é experimental e de cobertura parcial —
-        refaz SEM o filtro, para o documento ainda ser sintetizado. Com
-        SUMMARY_ONLY_FINDINGS=false o filtro é pulado e o comportamento é o original."""
-        if SUMMARY_ONLY_FINDINGS:
+        """Retrieval do AI Summary com o PRIMEIRO FILTRO por papel discursivo: só chunks
+        cujo discourse_role é um dos `roles` (ex.: ['achado'] ou ['achado','recomendacao']).
+        Se o filtro não trouxer nada (documento ainda sem o rótulo), refaz SEM o filtro,
+        para o documento ainda ser sintetizado. Com `roles` vazio/None não há filtro."""
+        if roles:
             points = await self._semantic.search_points(
-                query, limit=limit, type=type, uuid=uuid, only_findings=True,
+                query, limit=limit, type=type, uuid=uuid, findings_roles=roles,
             )
             if points:
                 return points
             log_api.info(
-                "summarize: sem chunks de achado%s para q=%r — fallback sem o filtro",
-                f" em {uuid}" if uuid else "", query,
+                "summarize: sem chunks de %s%s para q=%r — fallback sem o filtro",
+                "/".join(roles), f" em {uuid}" if uuid else "", query,
             )
         return await self._semantic.search_points(query, limit=limit, type=type, uuid=uuid)
 
     async def _retrieve_per_document(
         self, query: str, documents: Sequence[DocumentRef], *, limit: int, type: str,
+        roles: Optional[Sequence[str]] = None,
     ) -> list:
         """Uma recuperação INDEPENDENTE por documento: cada UUID vira uma consulta
         própria ao Qdrant (filtro item_uuid) com o seu próprio teto de `limit` chunks.
@@ -364,7 +388,7 @@ class SummaryService:
         problemático não derrubar a síntese dos demais."""
         resultados = await asyncio.gather(
             *(
-                self._search_points_findings(query, limit=limit, type=type, uuid=d.uuid)
+                self._search_points_filtered(query, limit=limit, type=type, roles=roles, uuid=d.uuid)
                 for d in documents
             ),
             return_exceptions=True,
@@ -390,22 +414,28 @@ class SummaryService:
         type: str = "hybrid",
         language: str = "pt-BR",
         documents: Optional[Sequence[DocumentRef]] = None,
+        focus: Optional[str] = None,
     ) -> SummaryResponse:
         """Síntese com cache (ver summary_cache.py): hit devolve a resposta guardada
         sem retrieval nem LLM; miss sintetiza e guarda. Só entra no cache síntese
         aproveitável — vazia (sem evidências, ou o saneamento consumiu tudo) ou ainda
         contaminada fica de fora, para a próxima requisição tentar de novo.
 
+        `focus` (achados|recomendacoes|ambas) escolhe o papel discursivo do 1º filtro;
+        None usa o default de config. Entra na chave do cache (resultados diferem por foco).
+
         A síntese do miss roda numa tarefa própria: se o cliente desconectar, ela
         termina e é guardada mesmo assim, e quem chegou junto com a mesma pergunta
         recebe o mesmo resultado."""
+        roles = _resolve_roles(focus)
         if self._cache is None:
             return await self._summarize(
-                query, limit=limit, type=type, language=language, documents=documents,
+                query, limit=limit, type=type, language=language, documents=documents, roles=roles,
             )
         docs = _unique_documents(documents)
         key = await run_in_threadpool(
-            self._cache.key, query, limit=limit, type=type, language=language, documents=docs,
+            self._cache.key, query, limit=limit, type=type, language=language,
+            documents=docs, roles=roles,
         )
         hit = await run_in_threadpool(self._cache.get, key)
         if hit is not None:
@@ -419,18 +449,18 @@ class SummaryService:
             return resp.model_copy(update={"query": query, "cached": True})
 
         task = asyncio.create_task(
-            self._summarize_and_store(key, query, limit, type, language, docs)
+            self._summarize_and_store(key, query, limit, type, language, docs, roles)
         )
         self._inflight[key] = task
         return await asyncio.shield(task)
 
     async def _summarize_and_store(
         self, key: str, query: str, limit: int, type: str, language: str,
-        docs: Sequence[DocumentRef],
+        docs: Sequence[DocumentRef], roles: Optional[Sequence[str]],
     ) -> SummaryResponse:
         try:
             resp = await self._summarize(
-                query, limit=limit, type=type, language=language, documents=docs,
+                query, limit=limit, type=type, language=language, documents=docs, roles=roles,
             )
             if resp.summary and not _contaminado(resp.summary, language):
                 try:
@@ -449,18 +479,19 @@ class SummaryService:
         type: str = "hybrid",
         language: str = "pt-BR",
         documents: Optional[Sequence[DocumentRef]] = None,
+        roles: Optional[Sequence[str]] = None,
     ) -> SummaryResponse:
         """Sintetiza as evidências recuperadas para `query`. Retrieval assíncrono +
         LLM em threadpool. Sem evidências → resposta com summary vazio (sem chamar o LLM).
 
-        `documents` vazia (o padrão, e o único caso do GET): uma recuperação global de
-        até `limit` chunks, com o teto de diversidade por documento — regra original,
-        inalterada. `documents` preenchida: uma recuperação por UUID, cada uma trazendo
-        até `limit` chunks (o k por documento), sem o teto de diversidade; a síntese é
-        uma só, sobre a união das evidências."""
+        `roles` (papéis discursivos já resolvidos) aplica o 1º filtro no retrieval, com
+        fallback sem filtro por documento. `documents` vazia (o padrão, e o único caso do
+        GET): uma recuperação global de até `limit` chunks, com o teto de diversidade por
+        documento. `documents` preenchida: uma recuperação por UUID, cada uma trazendo até
+        `limit` chunks (o k por documento), sem o teto; a síntese é uma só, sobre a união."""
         docs = _unique_documents(documents)
         if docs:
-            points = await self._retrieve_per_document(query, docs, limit=limit, type=type)
+            points = await self._retrieve_per_document(query, docs, limit=limit, type=type, roles=roles)
             # O cliente escolheu os documentos: o teto de diversidade sai de cena e cada
             # documento contribui com até os `limit` chunks que a sua consulta trouxe.
             evidences = _dedup_and_number(points, max_per_document=None)
@@ -468,9 +499,11 @@ class SummaryService:
                 "documents": [d.model_dump(exclude_none=True) for d in docs],
             }
         else:
-            points = await self._search_points_findings(query, limit=limit, type=type)
+            points = await self._search_points_filtered(query, limit=limit, type=type, roles=roles)
             evidences = _dedup_and_number(points)
             applied_filters = {}
+        if roles:
+            applied_filters["roles"] = list(roles)
 
         retrieval = RetrievalMetadata(
             type=type,

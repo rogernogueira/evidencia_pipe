@@ -52,8 +52,8 @@ class _SemanticFake:
         self.globais = globais
         self.vazios = set(vazios)
         self.erros = set(erros)
-        # UUIDs (ou None, p/ a busca global) sem nenhum chunk rotulado como achado: a
-        # consulta com only_findings=True volta vazia e dispara o fallback sem filtro.
+        # UUIDs (ou None, p/ a busca global) sem nenhum chunk rotulado: a consulta
+        # filtrada (findings_roles) volta vazia e dispara o fallback sem filtro.
         self.sem_achado = set(sem_achado)
         self.chamadas = []
 
@@ -61,14 +61,14 @@ class _SemanticFake:
         return True
 
     async def search_points(self, query, limit=5, type="hybrid", profile="", uuid=None,
-                            only_findings=False):
+                            findings_roles=None):
         self.chamadas.append({"query": query, "limit": limit, "type": type, "uuid": uuid,
-                              "only_findings": only_findings})
+                              "findings_roles": findings_roles})
         if uuid in self.erros:
             raise RuntimeError(f"Qdrant caiu para {uuid}")
         if uuid in self.vazios:
             return []
-        if only_findings and uuid in self.sem_achado:
+        if findings_roles and uuid in self.sem_achado:
             return []
         if uuid is None:
             return [_Ponto("global", i) for i in range(1, self.globais + 1)]
@@ -162,7 +162,8 @@ async def test_applied_filters_ecoa_os_documentos_consultados(llm):
         "documents": [
             {"uuid": UUID_A, "handle": "123456789/150"},
             {"uuid": UUID_B},
-        ]
+        ],
+        "roles": ["achado"],  # default do servidor ecoado
     }
 
 
@@ -219,18 +220,18 @@ async def test_sem_nenhuma_evidencia_nao_chama_o_llm(llm):
     assert r.summary == "" and r.mappings == []
     assert llm == []
     # Mesmo sem evidências, o contrato diz o que foi consultado.
-    assert r.applied_filters == {"documents": [{"uuid": UUID_A}]}
+    assert r.applied_filters == {"documents": [{"uuid": UUID_A}], "roles": ["achado"]}
     assert r.retrieval.per_document is True
 
 
 # --------------------------------------------------------------------------
-# Primeiro filtro: só chunks marcados como achado (SUMMARY_ONLY_FINDINGS)
+# Primeiro filtro: papel discursivo (focus → achados | recomendacoes | ambas)
 # --------------------------------------------------------------------------
 
 @pytest.mark.anyio
 async def test_retrieval_filtra_por_achado_por_padrao(llm):
-    """Com o filtro ligado (default), cada consulta por documento vai com
-    only_findings=True — e, achando chunks de achado, não há 2ª consulta."""
+    """Sem focus e com SUMMARY_ONLY_FINDINGS (default), cada consulta vai filtrada por
+    ['achado'] — e, achando chunks, não há 2ª consulta."""
     fake = _SemanticFake(por_uuid=2)
 
     r = await svc.SummaryService(fake).summarize(
@@ -238,13 +239,40 @@ async def test_retrieval_filtra_por_achado_por_padrao(llm):
     )
 
     assert [c["uuid"] for c in fake.chamadas] == [UUID_A, UUID_B]
-    assert all(c["only_findings"] is True for c in fake.chamadas)
+    assert all(c["findings_roles"] == ["achado"] for c in fake.chamadas)
     assert {m.dspace_uuid for m in r.mappings} == {UUID_A, UUID_B}
 
 
 @pytest.mark.anyio
+async def test_focus_recomendacoes_filtra_por_recomendacao(llm):
+    """focus='recomendacoes' → o filtro usa ['recomendacao'] e aparece em applied_filters."""
+    fake = _SemanticFake(globais=2)
+
+    r = await svc.SummaryService(fake).summarize("cobertura", focus="recomendacoes")
+
+    assert [c["findings_roles"] for c in fake.chamadas] == [["recomendacao"]]
+    assert r.applied_filters["roles"] == ["recomendacao"]
+
+
+@pytest.mark.anyio
+async def test_focus_ambas_filtra_por_achado_e_recomendacao(llm):
+    fake = _SemanticFake(globais=2)
+
+    r = await svc.SummaryService(fake).summarize("cobertura", focus="ambas")
+
+    assert [c["findings_roles"] for c in fake.chamadas] == [["achado", "recomendacao"]]
+    assert r.applied_filters["roles"] == ["achado", "recomendacao"]
+
+
+@pytest.mark.anyio
+async def test_focus_invalido_levanta(llm):
+    with pytest.raises(ValueError):
+        await svc.SummaryService(_SemanticFake()).summarize("cobertura", focus="xpto")
+
+
+@pytest.mark.anyio
 async def test_documento_sem_achado_cai_no_fallback_sem_filtro(llm):
-    """Documento sem nenhum chunk de achado: a consulta filtrada volta vazia e o
+    """Documento sem nenhum chunk do papel pedido: a consulta filtrada volta vazia e o
     retrieval refaz SEM o filtro, para o documento ainda ser sintetizado."""
     fake = _SemanticFake(por_uuid=2, sem_achado=[UUID_A])
 
@@ -253,9 +281,9 @@ async def test_documento_sem_achado_cai_no_fallback_sem_filtro(llm):
     )
 
     chamadas_a = [c for c in fake.chamadas if c["uuid"] == UUID_A]
-    assert [c["only_findings"] for c in chamadas_a] == [True, False]  # filtrada → fallback
+    assert [c["findings_roles"] for c in chamadas_a] == [["achado"], None]  # filtrada → fallback
     chamadas_b = [c for c in fake.chamadas if c["uuid"] == UUID_B]
-    assert [c["only_findings"] for c in chamadas_b] == [True]  # achou achado, sem fallback
+    assert [c["findings_roles"] for c in chamadas_b] == [["achado"]]  # achou, sem fallback
     assert {m.dspace_uuid for m in r.mappings} == {UUID_A, UUID_B}
     assert r.summary == LIMPO
 
@@ -266,13 +294,13 @@ async def test_busca_global_tambem_filtra_por_achado(llm):
 
     await svc.SummaryService(fake).summarize("cobertura")
 
-    assert [c["only_findings"] for c in fake.chamadas] == [True]
+    assert [c["findings_roles"] for c in fake.chamadas] == [["achado"]]
     assert [c["uuid"] for c in fake.chamadas] == [None]
 
 
 @pytest.mark.anyio
 async def test_filtro_desligado_mantem_o_comportamento_original(llm, monkeypatch):
-    """SUMMARY_ONLY_FINDINGS=false → nenhuma consulta filtrada, uma só por documento."""
+    """SUMMARY_ONLY_FINDINGS=false e sem focus → nenhuma consulta filtrada."""
     monkeypatch.setattr(svc, "SUMMARY_ONLY_FINDINGS", False)
     fake = _SemanticFake(por_uuid=2, sem_achado=[UUID_A])
 
@@ -280,7 +308,7 @@ async def test_filtro_desligado_mantem_o_comportamento_original(llm, monkeypatch
         "cobertura", documents=[DocumentRef(uuid=UUID_A)],
     )
 
-    assert [c["only_findings"] for c in fake.chamadas] == [False]
+    assert [c["findings_roles"] for c in fake.chamadas] == [None]
     assert {m.dspace_uuid for m in r.mappings} == {UUID_A}
 
 
@@ -300,7 +328,7 @@ async def test_documents_vazia_mantem_a_busca_global(llm, documents):
     assert len(fake.chamadas) == 1
     assert fake.chamadas[0]["uuid"] is None
     assert fake.chamadas[0]["limit"] == 5
-    assert r.applied_filters == {}
+    assert r.applied_filters == {"roles": ["achado"]}  # default do servidor, sem documentos
     assert r.retrieval.per_document is False
     assert r.retrieval.documents_count == 0
 
@@ -311,9 +339,9 @@ async def test_busca_global_mantem_o_teto_de_diversidade(llm):
     MESMO documento viram 2 evidências."""
     class _MesmoDoc(_SemanticFake):
         async def search_points(self, query, limit=5, type="hybrid", profile="", uuid=None,
-                                only_findings=False):
+                                findings_roles=None):
             self.chamadas.append({"query": query, "limit": limit, "type": type, "uuid": uuid,
-                                  "only_findings": only_findings})
+                                  "findings_roles": findings_roles})
             return [_Ponto("global", i) for i in range(1, 5)]
 
     r = await svc.SummaryService(_MesmoDoc()).summarize("cobertura", limit=4)
@@ -363,7 +391,7 @@ def test_post_sem_documents_cai_na_regra_atual(llm):
     assert resp.status_code == 200
     body = resp.json()
     assert body["retrieval"]["per_document"] is False
-    assert body["applied_filters"] == {}
+    assert body["applied_filters"] == {"roles": ["achado"]}  # default do servidor
     assert fake.chamadas[0]["uuid"] is None
     assert fake.chamadas[0]["limit"] == 5  # default do schema
 

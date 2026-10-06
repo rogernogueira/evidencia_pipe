@@ -91,6 +91,19 @@ async def test_parametros_diferentes_nao_compartilham_entrada(redis_fake, llm):
 
 
 @pytest.mark.anyio
+async def test_focus_diferente_nao_compartilha_entrada(redis_fake, llm):
+    """Focos diferentes dão sínteses diferentes → chaves distintas (nova chamada)."""
+    s = _service()
+
+    await s.summarize("cobertura", focus="achados")
+    await s.summarize("cobertura", focus="recomendacoes")
+    await s.summarize("cobertura", focus="ambas")
+    await s.summarize("cobertura", focus="achados")  # repete o 1º → cache hit
+
+    assert len(llm.chamadas) == 3
+
+
+@pytest.mark.anyio
 async def test_reindexar_invalida_o_cache(redis_fake, llm):
     s = _service()
 

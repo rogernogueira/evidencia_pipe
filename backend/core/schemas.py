@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -104,6 +104,13 @@ class SummarizeRequest(BaseModel):
         description=(
             f"Itens do DSpace a consultar um a um (máx. {SUMMARY_MAX_DOCUMENTS}); "
             "vazia = busca global (regra atual)"
+        ),
+    )
+    focus: Optional[Literal["achados", "recomendacoes", "ambas"]] = Field(
+        None,
+        description=(
+            "Papel discursivo do 1º filtro: 'achados' (constatações), 'recomendacoes' "
+            "(propostas de ação) ou 'ambas'. Ausente = default do servidor."
         ),
     )
 
