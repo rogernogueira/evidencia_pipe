@@ -92,7 +92,7 @@ services:
   # Qdrant — no modelo híbrido é externo (QDRANT_URL p/ outra máquina); aqui entra
   # no stack com volume próprio. A coleção é criada pelo backend no primeiro uso.
   qdrant:
-    image: qdrant/qdrant:v1.12.4
+    image: qdrant/qdrant:v1.17.1
     volumes:
       - qdrant_data:/qdrant/storage
     # 127.0.0.1: o Qdrant sobe SEM API key — não exponha na rede. Os workers falam
