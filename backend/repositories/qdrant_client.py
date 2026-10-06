@@ -37,6 +37,8 @@ from backend.core.config import (
     SEARCH_EXCLUDE_LOW_CONFIDENCE_VISUAL_DATA,
     SEARCH_EXCLUDE_NAVIGATION_LISTS,
     SEARCH_EXCLUDE_REFERENCES,
+    SUMMARY_FINDINGS_PAYLOAD_KEY,
+    SUMMARY_FINDINGS_ROLE,
 )
 from backend.core.logger import log, log_api
 from backend.core.schemas import SearchResult
@@ -134,16 +136,23 @@ class SemanticSearch:
         return self._available
 
     def _build_query_filter(
-        self, query: str, doc_id: Optional[str], uuid: Optional[str], profile: str
+        self, query: str, doc_id: Optional[str], uuid: Optional[str], profile: str,
+        only_findings: bool = False,
     ) -> Optional[Filter]:
-        """Monta o Filter do Qdrant: `uuid` → item_uuid, `doc_id` → doc_id, e o
-        filtro por perfil de recuperação (§21). Retorna None se nada a filtrar."""
+        """Monta o Filter do Qdrant: `uuid` → item_uuid, `doc_id` → doc_id, o filtro
+        por perfil de recuperação (§21), e `only_findings` → só chunks marcados como
+        achado. Retorna None se nada a filtrar."""
         conditions: list = []
         must_not: list = []
         if uuid and uuid.strip():
             conditions.append(FieldCondition(key="item_uuid", match=MatchValue(value=uuid.strip())))
         if doc_id and doc_id.strip():
             conditions.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id.strip())))
+        if only_findings:
+            # Rótulo discursivo é multirrótulo (lista no payload); no Qdrant, MatchValue
+            # casa quando o valor está CONTIDO na lista. Primeiro filtro do AI Summary.
+            conditions.append(FieldCondition(
+                key=SUMMARY_FINDINGS_PAYLOAD_KEY, match=MatchValue(value=SUMMARY_FINDINGS_ROLE)))
 
         explicit = (profile or "").strip().lower()
         if explicit or _search_filtering_enabled():
@@ -248,6 +257,7 @@ class SemanticSearch:
         type: str = "hybrid",
         profile: str = "",
         uuid: Optional[str] = None,
+        only_findings: bool = False,
     ) -> list:
         """Como search(), mas devolve os PONTOS crus do Qdrant (payload completo).
 
@@ -257,14 +267,15 @@ class SemanticSearch:
 
         `uuid` restringe a consulta a um item do DSpace (payload.item_uuid) — é como o
         summary faz uma recuperação independente por documento, cada chamada trazendo
-        seus próprios `limit` chunks.
+        seus próprios `limit` chunks. `only_findings` restringe aos chunks marcados como
+        achado (primeiro filtro do AI Summary).
         """
         if not await self.ensure_connected():
             return []
         if not query or not query.strip():
             return []
         try:
-            query_filter = self._build_query_filter(query, None, uuid, profile)
+            query_filter = self._build_query_filter(query, None, uuid, profile, only_findings)
             return await self._query_points(query, limit, type, query_filter)
         except Exception as exc:
             log_api.error("Erro no retrieval do summary: %s", exc)

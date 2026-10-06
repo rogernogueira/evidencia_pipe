@@ -32,6 +32,7 @@ from backend.core.config import (
     LLM_ENRICH_TIMEOUT_SECONDS,
     LLM_SUMMARY_DISABLE_THINKING,
     LLM_SUMMARY_MODEL,
+    SUMMARY_ONLY_FINDINGS,
 )
 from backend.core.logger import log_api
 from backend.core.schemas import (
@@ -329,6 +330,26 @@ class SummaryService:
         """True se há chave de LLM configurada (mesma do enrich)."""
         return llm_enrich_service.is_available()
 
+    async def _search_points_findings(
+        self, query: str, *, limit: int, type: str, uuid: Optional[str] = None,
+    ) -> list:
+        """Retrieval do AI Summary com o PRIMEIRO FILTRO: só chunks marcados como achado
+        (payload exp_discourse_role='achado'). Se o filtro não trouxer nada — documento
+        não rotulado, já que a marcação ainda é experimental e de cobertura parcial —
+        refaz SEM o filtro, para o documento ainda ser sintetizado. Com
+        SUMMARY_ONLY_FINDINGS=false o filtro é pulado e o comportamento é o original."""
+        if SUMMARY_ONLY_FINDINGS:
+            points = await self._semantic.search_points(
+                query, limit=limit, type=type, uuid=uuid, only_findings=True,
+            )
+            if points:
+                return points
+            log_api.info(
+                "summarize: sem chunks de achado%s para q=%r — fallback sem o filtro",
+                f" em {uuid}" if uuid else "", query,
+            )
+        return await self._semantic.search_points(query, limit=limit, type=type, uuid=uuid)
+
     async def _retrieve_per_document(
         self, query: str, documents: Sequence[DocumentRef], *, limit: int, type: str,
     ) -> list:
@@ -343,7 +364,7 @@ class SummaryService:
         problemático não derrubar a síntese dos demais."""
         resultados = await asyncio.gather(
             *(
-                self._semantic.search_points(query, limit=limit, type=type, uuid=d.uuid)
+                self._search_points_findings(query, limit=limit, type=type, uuid=d.uuid)
                 for d in documents
             ),
             return_exceptions=True,
@@ -447,7 +468,7 @@ class SummaryService:
                 "documents": [d.model_dump(exclude_none=True) for d in docs],
             }
         else:
-            points = await self._semantic.search_points(query, limit=limit, type=type)
+            points = await self._search_points_findings(query, limit=limit, type=type)
             evidences = _dedup_and_number(points)
             applied_filters = {}
 

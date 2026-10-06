@@ -22,7 +22,7 @@ from pathlib import Path
 import psutil
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, \
-    SparseIndexParams, SparseVectorParams, VectorParams
+    SetPayload, SetPayloadOperation, SparseIndexParams, SparseVectorParams, VectorParams
 
 
 from backend.indexing.chunks import MinerUChunker
@@ -784,6 +784,75 @@ def push_llm_metadata_to_qdrant(doc_id: str, payload: dict) -> int:
     client.set_payload(collection_name=COLLECTION_NAME, payload=payload, points=selector, wait=True)
     log.info("push_llm_metadata_to_qdrant: metadados LLM propagados a %d ponto(s) de '%s'.", n, doc_id)
     return n
+
+
+def fetch_document_chunks_for_classification(doc_id: str) -> list[dict]:
+    """Lê do Qdrant os pontos JÁ INDEXADOS de um documento e devolve o mínimo para a
+    classificação discursiva: {point_id, chunk_id, text, section_title, content_type}.
+
+    Scroll paginado por doc_name (sem vetores). Lista vazia se o doc não foi indexado.
+    É a entrada do estágio de classificação: o point_id obtido aqui alimenta
+    push_discourse_roles_to_qdrant (set_payload por ponto)."""
+    client, _, _ = _get_indexer()
+    doc_name = f"{doc_id}.md"
+    selector = Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))])
+    out: list[dict] = []
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=selector,
+            with_payload=["chunk_id", "text", "content", "section_title", "section", "content_type"],
+            with_vectors=False,
+            limit=256,
+            offset=offset,
+        )
+        for p in points:
+            pl = p.payload or {}
+            out.append({
+                "point_id": str(p.id),
+                "chunk_id": pl.get("chunk_id"),
+                "text": pl.get("text") or pl.get("content") or "",
+                "section_title": pl.get("section_title") or pl.get("section"),
+                "content_type": pl.get("content_type"),
+            })
+        if offset is None:
+            break
+    return out
+
+
+def push_discourse_roles_to_qdrant(doc_id: str, labels_by_point_id: dict) -> int:
+    """Grava o papel discursivo POR CHUNK nos pontos existentes do documento, via
+    set_payload por ponto (batch_update_points). Merge: não toca vetores nem outros
+    campos. Espelha experiments/chunk_classes/09_push_labels_to_qdrant.py.
+
+    `labels_by_point_id`: {point_id: {'labels': [...], 'confidence': {...},
+    'model'?: str, 'source'?: str}}. Retorna o número de pontos atualizados."""
+    from backend.core.config import DISCOURSE_CLASSIFY_MODEL
+    from backend.services.discourse_classify_service import SOURCE as DISCOURSE_SOURCE
+
+    if not labels_by_point_id:
+        return 0
+
+    client, _, _ = _get_indexer()
+    ops = []
+    for point_id, result in labels_by_point_id.items():
+        labels = (result or {}).get("labels") or []
+        if not labels:
+            continue
+        payload = {
+            "discourse_role": labels,
+            "discourse_role_conf": result.get("confidence") or {},
+            "discourse_role_model": result.get("model") or DISCOURSE_CLASSIFY_MODEL,
+            "discourse_role_source": result.get("source") or DISCOURSE_SOURCE,
+        }
+        ops.append(SetPayloadOperation(set_payload=SetPayload(payload=payload, points=[point_id])))
+    if not ops:
+        return 0
+
+    client.batch_update_points(collection_name=COLLECTION_NAME, update_operations=ops, wait=True)
+    log.info("push_discourse_roles_to_qdrant: discourse_role gravado em %d ponto(s) de '%s'.", len(ops), doc_id)
+    return len(ops)
 
 
 def sync_llm_metadata_to_qdrant(doc_id: str) -> int:

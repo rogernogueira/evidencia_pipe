@@ -175,6 +175,68 @@ def test_enrich_after_index_propagates_to_qdrant(wired, monkeypatch):
     assert pushed["payload"]["titulo_candidato"] == "T"
 
 
+def test_classify_after_index_propagates_to_qdrant(wired, monkeypatch):
+    """Classificação DESACOPLADA rodando APÓS a indexação grava discourse_role por chunk
+    no Qdrant (push_discourse_roles_to_qdrant), sem re-embedar."""
+    import backend.indexing.index_chunks as idx
+    import backend.services.discourse_classify_service as classifier
+
+    monkeypatch.setattr(classifier, "is_available", lambda: True)
+    monkeypatch.setattr(
+        idx, "fetch_document_chunks_for_classification",
+        lambda doc_id: [{"point_id": "p1", "text": "verificou-se que 32%..."},
+                        {"point_id": "p2", "text": "recomenda-se rever..."}],
+    )
+    monkeypatch.setattr(
+        classifier, "classify_chunks",
+        lambda records: {"p1": {"labels": ["achado"], "confidence": {"achado": 0.9}},
+                         "p2": {"labels": ["recomendacao"], "confidence": {}}},
+    )
+    pushed = {}
+    monkeypatch.setattr(
+        idx, "push_discourse_roles_to_qdrant",
+        lambda doc_id, labels: pushed.update(doc_id=doc_id, labels=labels) or len(labels),
+    )
+
+    from backend.services import pipeline_stages as stages
+
+    ctx = stages.stage_download(bs_uuid="bs-5", filename="doc-5.pdf", job_id="doc-5")
+    ctx = stages.stage_mineru(ctx)
+    stages.stage_index(ctx)                 # índice primeiro (desacoplado)
+    stages.stage_classify_discourse(ctx)    # classificação depois → propaga ao Qdrant
+
+    assert pushed.get("doc_id") == "doc-5"
+    assert set(pushed["labels"]) == {"p1", "p2"}
+    assert pushed["labels"]["p1"]["labels"] == ["achado"]
+
+    from backend.services.manifest_repository import get_manifest_repository
+    m = get_manifest_repository().load_from_uri(ctx.artifact_manifest_uri)
+    assert m.is_stage_completed("discourse")
+
+
+def test_classify_noop_sem_classificador(wired, monkeypatch):
+    """Classificador desabilitado/sem chave → no-op, não toca o Qdrant."""
+    import backend.indexing.index_chunks as idx
+    import backend.services.discourse_classify_service as classifier
+
+    monkeypatch.setattr(classifier, "is_available", lambda: False)
+    chamado = {"push": False}
+    monkeypatch.setattr(idx, "push_discourse_roles_to_qdrant",
+                        lambda *a, **k: chamado.update(push=True) or 0)
+
+    from backend.services import pipeline_stages as stages
+
+    ctx = stages.stage_download(bs_uuid="bs-6", filename="doc-6.pdf", job_id="doc-6")
+    ctx = stages.stage_mineru(ctx)
+    stages.stage_index(ctx)
+    stages.stage_classify_discourse(ctx)
+
+    assert chamado["push"] is False
+    from backend.services.manifest_repository import get_manifest_repository
+    m = get_manifest_repository().load_from_uri(ctx.artifact_manifest_uri)
+    assert not m.is_stage_completed("discourse")
+
+
 def test_download_retry_reuses_source(wired):
     from backend.services import pipeline_stages as stages
     from backend.services.manifest_repository import get_manifest_repository

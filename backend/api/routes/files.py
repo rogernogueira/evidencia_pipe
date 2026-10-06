@@ -44,8 +44,11 @@ from backend.core.logger import log_api
 from backend.core.schemas import (
     ART_METADATA_CANDIDATES,
     CTX_STAGE_EXTRACTED,
+    CTX_STAGE_INDEXED,
     PipelineContext,
+    STAGE_DISCOURSE,
 )
+from backend.services import discourse_classify_service
 from backend.services import ingest_service as ingest
 from backend.services import llm_enrich_service as llm_enrich
 from backend.services import pipeline_stages as stages
@@ -271,6 +274,47 @@ def enrich_job_metadata(
     if ref is None:
         raise HTTPException(status_code=502, detail="Falha no step de LLM: metadados não gerados.")
     return JSONResponse(store.read_json(ref.object_key))
+
+
+@router.post("/api/files/classify/{job_id}")
+def classify_job_discourse(job_id: str) -> JSONResponse:
+    """Classifica os chunks JÁ INDEXADOS do job por papel discursivo (discourse_role) e
+    grava o rótulo por ponto no Qdrant (set_payload). Reusa stage_classify_discourse
+    (force). Requer o documento já indexado (fluxo v2 com manifesto)."""
+    log_api.info("POST /api/files/classify/%s", job_id)
+    if not discourse_classify_service.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Classificador indisponível: ligue DISCOURSE_CLASSIFY_ENABLED e configure a chave LLM.",
+        )
+
+    job = get_job(job_id)
+    manifest_uri = (job or {}).get("artifact_manifest_uri")
+    pipeline_id = (job or {}).get("pipeline_id")
+    document_id = (job or {}).get("document_id", job_id)
+    if not manifest_uri or not pipeline_id:
+        raise HTTPException(status_code=404, detail="Job sem manifesto v2 — classificação indisponível.")
+
+    from backend.services.manifest_repository import get_manifest_repository
+
+    ctx = PipelineContext.model_validate({
+        "pipeline_id": pipeline_id,
+        "job_id": job_id,
+        "document_id": document_id,
+        "artifact_manifest_uri": manifest_uri,
+        "current_stage": CTX_STAGE_INDEXED,
+        "force": True,
+    })
+    stages.stage_classify_discourse(ctx)
+
+    manifest = get_manifest_repository().load(pipeline_id, document_id)
+    st = manifest.stages.get(STAGE_DISCOURSE)
+    return JSONResponse({
+        "job_id": job_id,
+        "document_id": document_id,
+        "status": (st.status if st else "SKIPPED"),
+        "warnings": manifest.warnings,
+    })
 
 
 @router.get("/api/files/active", dependencies=[Depends(dspace_admin)])

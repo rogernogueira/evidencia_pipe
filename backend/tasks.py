@@ -256,6 +256,27 @@ def enrich_after_index(summary):
     return summary
 
 
+@app.task
+def classify_after_index(summary):
+    """Follow-up DESACOPLADO da classificação discursiva, disparado APÓS a indexação
+    (fila: llm). Recebe o `summary` de indexar_qdrant, reconstrói o contexto do manifesto
+    e roda stage_classify_discourse, que grava `discourse_role` por chunk no Qdrant
+    (set_payload). Totalmente best-effort: NUNCA altera o status "concluido" do job nem
+    quebra nada — o índice já é autoritativo. Retorna o `summary` intacto."""
+    try:
+        manifest_uri = (summary or {}).get("artifact_manifest_uri")
+        if not manifest_uri:
+            log.warning("[discourse follow-up] sem artifact_manifest_uri no summary — pulando.")
+            return summary
+        ctx = stages.build_context_from_manifest(manifest_uri, stage=CTX_STAGE_INDEXED)
+        ctx = stages.stage_classify_discourse(ctx)
+        if ctx.warnings_count:
+            set_status(ctx.job_id, "concluido", stage="discourse", warnings_count=ctx.warnings_count)
+    except Exception as exc:  # pragma: no cover — barreira best-effort
+        log.warning("[discourse follow-up] classificação desacoplada falhou (best-effort): %s", exc)
+    return summary
+
+
 # --------------------------------------------------------------------------
 # Indexação — chunking + embedding + upsert no Qdrant (fila: gpu, concurrency=1)
 # --------------------------------------------------------------------------

@@ -215,6 +215,7 @@ STAGE_DOWNLOAD = "download"
 STAGE_MINERU = "mineru"
 STAGE_ENRICHMENT = "enrichment"
 STAGE_INDEXING = "indexing"
+STAGE_DISCOURSE = "discourse"
 
 # Rótulos de progresso no PipelineContext.current_stage.
 CTX_STAGE_QUEUED = "queued"

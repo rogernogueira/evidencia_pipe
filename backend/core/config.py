@@ -221,6 +221,27 @@ LLM_ENRICH_REVIEW_THRESHOLD = float(
 # agora desacoplado da indexação.
 LLM_ENRICH_AUTO = (os.getenv("LLM_ENRICH_AUTO", "true").strip().lower() in {"1", "true", "yes", "on"})
 
+# Classificação discursiva de chunks por LLM (discourse_classify_service) — estágio
+# DESACOPLADO que roda como follow-up APÓS a indexação e grava `discourse_role` (papel
+# discursivo multirrótulo: achado, recomendacao, metodologia, …) por chunk no payload
+# do Qdrant. Reusa a chave/endpoint do enrich (LLM_ENRICH_API_KEY/BASE_URL); uma chamada
+# ao LLM por chunk (tool-calling com enum, reasoning off), com concorrência limitada.
+#
+# ENABLED default FALSE (opt-in explícito): reusa a MESMA chave do enrich, então não pode
+# disparar sozinho ~N chamadas/documento só porque o enrich está configurado. Com ENABLED
+# e chave presentes, AUTO (default true) o anexa à ingestão como follow-up pós-índice.
+DISCOURSE_CLASSIFY_ENABLED = (
+    os.getenv("DISCOURSE_CLASSIFY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+)
+DISCOURSE_CLASSIFY_AUTO = (
+    os.getenv("DISCOURSE_CLASSIFY_AUTO", "true").strip().lower() in {"1", "true", "yes", "on"}
+)
+DISCOURSE_CLASSIFY_MODEL = (os.getenv("DISCOURSE_CLASSIFY_MODEL") or LLM_ENRICH_MODEL).strip()
+# Nº de chunks classificados em paralelo (o cliente OpenAI é síncrono → ThreadPoolExecutor).
+DISCOURSE_CLASSIFY_CONCURRENCY = int(os.getenv("DISCOURSE_CLASSIFY_CONCURRENCY", "8"))
+# Teto de caracteres do texto de cada chunk enviado ao LLM (controle de custo/contexto).
+DISCOURSE_CLASSIFY_MAX_CHARS = int(os.getenv("DISCOURSE_CLASSIFY_MAX_CHARS", "6000"))
+
 # --------------------------------------------------------------------------
 # AI Summary (GET e POST /api/search/summarize) — usa a MESMA config de LLM do enrich,
 # com dois pontos próprios: o modelo e o "thinking".
@@ -253,6 +274,22 @@ LLM_SUMMARY_MODEL = (os.getenv("LLM_SUMMARY_MODEL") or LLM_ENRICH_MODEL).strip()
 # esperando: sem teto, uma lista grande vira latência na resposta e carga no Qdrant.
 # Acima disto a requisição é recusada com 422 antes de qualquer retrieval.
 SUMMARY_MAX_DOCUMENTS = int(os.getenv("SUMMARY_MAX_DOCUMENTS", "20"))
+
+# Primeiro filtro do AI Summary: compor a síntese APENAS com chunks marcados como
+# "achado" (constatação sustentada por evidência) pelo classificador discursivo. O
+# rótulo vive no payload do Qdrant como uma LISTA em SUMMARY_FINDINGS_PAYLOAD_KEY que
+# contém SUMMARY_FINDINGS_ROLE. O campo oficial é `discourse_role`, gravado pelo estágio
+# de classificação do pipeline (discourse_classify_service); o legado `exp_discourse_role`
+# (gravado pelo experimento) foi migrado para ele por scripts/migrate_discourse_role.py.
+#
+# A cobertura pode ser parcial (docs ainda não classificados). Se a consulta filtrada não
+# trouxer nenhum chunk de achado, o retrieval refaz SEM o filtro, para o documento ainda
+# ser sintetizado — ver summary_service._search_points_findings.
+SUMMARY_ONLY_FINDINGS = (
+    os.getenv("SUMMARY_ONLY_FINDINGS", "true").strip().lower() in {"1", "true", "yes", "on"}
+)
+SUMMARY_FINDINGS_PAYLOAD_KEY = os.getenv("SUMMARY_FINDINGS_PAYLOAD_KEY", "discourse_role").strip()
+SUMMARY_FINDINGS_ROLE = os.getenv("SUMMARY_FINDINGS_ROLE", "achado").strip()
 
 # Cache do AI Summary (ver backend/services/summary_cache.py). A síntese custa uma ou
 # duas chamadas ao LLM com o usuário esperando, e a mesma pergunta se repete muito na

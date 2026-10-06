@@ -45,6 +45,7 @@ from backend.core.schemas import (
     CTX_STAGE_ENRICHED,
     CTX_STAGE_EXTRACTED,
     PipelineContext,
+    STAGE_DISCOURSE,
     STAGE_DOWNLOAD,
     STAGE_ENRICHMENT,
     STAGE_INDEXING,
@@ -385,6 +386,68 @@ def stage_enrich(ctx: PipelineContext) -> PipelineContext:
         warnings += 1
 
     return _replace_stage(ctx, CTX_STAGE_ENRICHED, warnings=warnings)
+
+
+def stage_classify_discourse(ctx: PipelineContext) -> PipelineContext:
+    """Classificação discursiva POR CHUNK (discourse_role), DESACOPLADA da indexação.
+
+    Roda como follow-up pós-índice: lê os pontos já indexados do documento no Qdrant,
+    classifica cada chunk com o LLM e grava `discourse_role` por ponto via set_payload.
+    Best-effort: nunca quebra. No-op se o classificador está desabilitado/sem chave, se
+    o documento ainda não foi indexado, ou se já classificado (idempotente, salvo force)."""
+    from backend.services import discourse_classify_service as classifier
+
+    repo = get_manifest_repository()
+    pipeline_id = str(ctx.pipeline_id)
+    document_id = ctx.document_id
+    warnings = ctx.warnings_count
+
+    if not classifier.is_available():
+        log.info("[discourse] classificador desabilitado/sem chave — pulando '%s'.", document_id)
+        return _replace_stage(ctx, ctx.current_stage)
+
+    manifest = repo.load_from_uri(ctx.artifact_manifest_uri)
+    if not manifest.is_stage_completed(STAGE_INDEXING):
+        log.info("[discourse] doc '%s' ainda não indexado — pulando (nada a classificar).", document_id)
+        return _replace_stage(ctx, ctx.current_stage)
+    if not ctx.force and manifest.is_stage_completed(STAGE_DISCOURSE):
+        log.info("[discourse] '%s' já classificado (retry idempotente).", document_id)
+        return _replace_stage(ctx, ctx.current_stage)
+
+    repo.start_stage(pipeline_id, document_id, STAGE_DISCOURSE)
+    try:
+        from backend.indexing.index_chunks import (
+            fetch_document_chunks_for_classification,
+            push_discourse_roles_to_qdrant,
+        )
+        records = fetch_document_chunks_for_classification(document_id)
+        labels = classifier.classify_chunks(records)
+        n = push_discourse_roles_to_qdrant(document_id, labels)
+        with repo.update(pipeline_id, document_id) as m:
+            if n < len(records):
+                m.warnings.append(
+                    f"discourse: {n}/{len(records)} chunk(s) de '{document_id}' classificados"
+                )
+            st = m.stage(STAGE_DISCOURSE)
+            st.status = "COMPLETED"
+            st.completed_at = _now()
+        if n < len(records):
+            warnings += 1
+        log.info("[discourse] '%s': %d/%d chunk(s) com discourse_role.", document_id, n, len(records))
+    except Exception as exc:
+        # Best-effort: registra aviso/erro no manifesto e SEGUE (o índice é autoritativo).
+        log.error("[discourse] falhou para '%s': %s", document_id, exc)
+        try:
+            with repo.update(pipeline_id, document_id) as m:
+                m.warnings.append(f"discourse falhou: {type(exc).__name__}: {str(exc)[:200]}")
+                st = m.stage(STAGE_DISCOURSE)
+                st.status = "FAILED"
+                st.error = str(exc)[:500]
+        except Exception:
+            pass
+        warnings += 1
+
+    return _replace_stage(ctx, ctx.current_stage, warnings=warnings)
 
 
 # ==========================================================================

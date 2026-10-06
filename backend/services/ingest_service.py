@@ -21,6 +21,7 @@ from pathlib import Path
 
 from backend.core import config as settings
 from backend.core.logger import log
+from backend.services import discourse_classify_service
 from backend.services import llm_enrich_service as llm_enrich
 from backend.services.job_store import clear_failed, set_status
 
@@ -72,17 +73,21 @@ def build_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force):
 
 
 def enqueue_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force):
-    """Enfileira a chain obrigatória e, quando o enrich está habilitado e há provedor
-    LLM configurado, anexa enrich_after_index como follow-up DESACOPLADO (link) que
-    roda APÓS a indexação — o índice nunca espera nem depende do LLM."""
-    from backend.tasks import enrich_after_index
+    """Enfileira a chain obrigatória e anexa os follow-ups DESACOPLADOS habilitados como
+    links que rodam APÓS a indexação — o índice nunca espera nem depende do LLM:
+      - enrich_after_index: metadados de documento (se LLM_ENRICH_AUTO + chave);
+      - classify_after_index: discourse_role por chunk (se DISCOURSE_CLASSIFY_AUTO + chave).
+    Ambos recebem o summary da indexação e são independentes (chaves de payload distintas)."""
+    from backend.tasks import classify_after_index, enrich_after_index
 
     clear_failed(job_id)  # (re)enfileirar supera uma falha anterior
     sig = build_chain(bs_uuid, filename, job_id, item_uuid, item_handle, force)
-    link = None
+    links = []
     if settings.LLM_ENRICH_AUTO and llm_enrich.is_available():
-        link = enrich_after_index.s()
-    sig.apply_async(link=link)
+        links.append(enrich_after_index.s())
+    if settings.DISCOURSE_CLASSIFY_AUTO and discourse_classify_service.is_available():
+        links.append(classify_after_index.s())
+    sig.apply_async(link=links or None)
 
 
 def enqueue_item_pdfs(item_uuid: str, pdfs: list[dict], force: bool) -> list[dict]:

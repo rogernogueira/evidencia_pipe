@@ -124,7 +124,10 @@ async def test_sem_evidencias_nao_entra_no_cache(redis_fake, llm):
     await s.summarize("nada")
     await s.summarize("nada")
 
-    assert len(fake.chamadas) == 2
+    # Síntese vazia não entra no cache → a 2ª chamada refaz o retrieval. Cada summarize
+    # faz 2 consultas: a filtrada por achado volta vazia e dispara o fallback sem filtro.
+    assert len(fake.chamadas) == 4
+    assert all(c["uuid"] is None for c in fake.chamadas)
     assert not redis_fake.keys("summary:resp:*")
 
 
