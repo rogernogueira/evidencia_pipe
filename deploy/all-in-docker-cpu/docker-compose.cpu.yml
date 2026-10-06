@@ -1,0 +1,202 @@
+# ESBOÇO — stack TUDO-EM-DOCKER, CPU-only (sem GPU, sem systemd, sem venv no host).
+#
+# Diferente do docker-compose.yml da raiz (modelo híbrido: infra em contêiner +
+# API/workers no host + Qdrant externo), aqui TUDO sobe junto:
+#   infra:  redis, flower, minio(+init), qdrant
+#   GPU→CPU: mineru-cpu (pipeline), bge-m3-cpu (denso+esparso num contêiner só)
+#   app:    api (FastAPI), worker-light, worker-index  (mesma imagem)
+#
+# Rodar (a partir deste diretório):
+#   docker compose -f docker-compose.cpu.yml build
+#   docker compose -f docker-compose.cpu.yml up -d
+#
+# Contextos de build apontam para a raiz do repo via ../.. — rode o compose
+# daqui (deploy/all-in-docker-cpu/) para os caminhos baterem.
+name: evidencia-pipe-cpu
+
+x-app-env: &app-env
+  # .env da raiz primeiro; env.cpu sobrescreve URLs p/ nomes de serviço.
+  env_file:
+    - ../../.env
+    - ./env.cpu
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0
+    command: ["celery", "--broker=redis://redis:6379/0", "flower", "--port=5555"]
+    environment:
+      FLOWER_UNAUTHENTICATED_API: "true"
+    # 127.0.0.1: a API do Flower fica SEM autenticação — nunca na LAN. Acesse via
+    # túnel SSH (`ssh -L 5555:127.0.0.1:5555 ...:25000`) ou reverse proxy com auth.
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    # 127.0.0.1: bucket privado + console administrativo não vão para a LAN (UFW
+    # inativo no host). Para servir presigned URLs a outras máquinas, ponha um
+    # reverse proxy na frente só da :9000.
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-evidencia-pipe}
+      MINIO_BUCKET_VERSIONING: ${MINIO_BUCKET_VERSIONING:-true}
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb --ignore-existing local/\"$$MINIO_BUCKET\";
+      mc anonymous set none local/\"$$MINIO_BUCKET\";
+      if [ \"$$MINIO_BUCKET_VERSIONING\" = \"true\" ]; then mc version enable local/\"$$MINIO_BUCKET\"; fi;
+      echo 'bucket pronto';
+      "
+    restart: "no"
+
+  # Qdrant — no modelo híbrido é externo (QDRANT_URL p/ outra máquina); aqui entra
+  # no stack com volume próprio. A coleção é criada pelo backend no primeiro uso.
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # 127.0.0.1: o Qdrant sobe SEM API key — não exponha na rede. Os workers falam
+    # com ele pela rede interna do compose (http://qdrant:6333), não por esta porta.
+    ports:
+      - "127.0.0.1:6333:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MinerU pipeline em CPU (imagem deste esboço). LENTO — ver deploy/mineru-cpu.
+  mineru-cpu:
+    build:
+      context: ../mineru-cpu
+    image: evidencia_mineru:cpu
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_DEVICE_MODE: cpu
+    # 127.0.0.1: uso interno (worker extract → http://mineru-cpu:8010). A porta no
+    # host serve só para debug local; o MinerU não tem autenticação.
+    ports:
+      - "127.0.0.1:8010:8010"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8010/docs || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+
+  # Embedding bge-m3 em CPU — UM contêiner serve as duas pooling tasks.
+  # Reusa deploy/bge-m3-cpu, mas SEM network_mode host (precisa do DNS do compose).
+  bge-m3-cpu:
+    build:
+      context: ../bge-m3-cpu
+      args:
+        EMBED_MODEL: ${EMBED_MODEL:-BAAI/bge-m3}
+    image: evidencia_bge_m3_cpu:local
+    environment:
+      EMBED_API_MODEL: ${EMBED_API_MODEL:-BAAI/bge-m3}
+      EMBED_MAX_LEN: ${EMBED_MAX_LEN:-8192}
+      OMP_NUM_THREADS: ${EMBED_CPU_THREADS:-8}
+      EMBED_CPU_MAX_BATCH_TOKENS: ${EMBED_CPU_MAX_BATCH_TOKENS:-16384}
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    # 127.0.0.1: uso interno (worker-index → http://bge-m3-cpu:8000). Porta no host
+    # só para debug local.
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
+
+  # ---- Aplicação (mesma imagem, 3 papéis) -------------------------------------
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/all-in-docker-cpu/Dockerfile
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["python", "backend/main.py"]
+    # 127.0.0.1 por padrão (host sem UFW, INPUT ACCEPT). Para expor a API na LAN,
+    # troque por "8020:8020" CONSCIENTEMENTE, ou — recomendado — ponha um reverse
+    # proxy (nginx/caddy) com TLS e auth na frente desta porta de loopback.
+    ports:
+      - "127.0.0.1:8020:8020"
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Filas rápidas: download (DSpace), extract (chama o MinerU), llm (enriquecimento).
+  # -c baixo de propósito: em CPU, 4 extrações MinerU paralelas derrubam o host.
+  worker-light:
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["celery", "-A", "backend.celery_app", "worker",
+              "-Q", "download,extract,llm", "-c", "2", "-E", "-n", "light@%h"]
+    depends_on:
+      api: {condition: service_started}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Fila `gpu` = indexação (embedding + upsert Qdrant). -c 1: serializa o estágio
+  # pesado, como no host. Sem GPU aqui — o nome da fila é herdado do modelo híbrido.
+  worker-index:
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["celery", "-A", "backend.celery_app", "worker",
+              "-Q", "gpu", "-c", "1", "-E", "-n", "index@%h"]
+    depends_on:
+      api: {condition: service_started}
+      redis: {condition: service_healthy}
+      bge-m3-cpu: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  minio_data:
+  qdrant_data:

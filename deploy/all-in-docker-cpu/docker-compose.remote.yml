@@ -1,0 +1,139 @@
+# INFRA + APP aqui; BGE e MinerU em OUTRO host (com GPU). É o docker-compose.cpu.yml
+# SEM os serviços de inferência locais (mineru-cpu, bge-m3-cpu) — eles rodam no host
+# de GPU a partir do docker-compose.yml da RAIZ (--profile gpu). As URLs remotas
+# ficam em env.remote.
+#
+# Rodar (a partir deste diretório):
+#   # 1) edite env.remote: troque GPU_HOST pelo IP do host de GPU
+#   docker compose -f docker-compose.remote.yml build
+#   docker compose -f docker-compose.remote.yml up -d
+#
+# Portas publicadas em 127.0.0.1 (host sem UFW) — ver docker-compose.cpu.yml.
+name: evidencia-pipe-remote
+
+x-app-env: &app-env
+  env_file:
+    - ../../.env
+    - ./env.remote
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0
+    command: ["celery", "--broker=redis://redis:6379/0", "flower", "--port=5555"]
+    environment:
+      FLOWER_UNAUTHENTICATED_API: "true"
+    ports:
+      - "127.0.0.1:5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-evidencia-pipe}
+      MINIO_BUCKET_VERSIONING: ${MINIO_BUCKET_VERSIONING:-true}
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb --ignore-existing local/\"$$MINIO_BUCKET\";
+      mc anonymous set none local/\"$$MINIO_BUCKET\";
+      if [ \"$$MINIO_BUCKET_VERSIONING\" = \"true\" ]; then mc version enable local/\"$$MINIO_BUCKET\"; fi;
+      echo 'bucket pronto';
+      "
+    restart: "no"
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---- Aplicação (mesma imagem do stack CPU) ----------------------------------
+  # Requer a imagem evidencia_pipe_app:local já construída (docker-compose.cpu.yml
+  # build api) OU descomente o build abaixo.
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/all-in-docker-cpu/Dockerfile
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["python", "backend/main.py"]
+    ports:
+      - "127.0.0.1:8020:8020"
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+    restart: unless-stopped
+
+  worker-light:
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["celery", "-A", "backend.celery_app", "worker",
+              "-Q", "download,extract,llm", "-c", "2", "-E", "-n", "light@%h"]
+    depends_on:
+      api: {condition: service_started}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  # Fila `gpu` = indexação (embedding remoto + upsert Qdrant). Sem depends_on de
+  # inferência: BGE é remoto. O worker falha explícito na chamada se a URL estiver fora.
+  worker-index:
+    image: evidencia_pipe_app:local
+    <<: *app-env
+    command: ["celery", "-A", "backend.celery_app", "worker",
+              "-Q", "gpu", "-c", "1", "-E", "-n", "index@%h"]
+    depends_on:
+      api: {condition: service_started}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  minio_data:
+  qdrant_data:

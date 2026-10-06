@@ -11,6 +11,9 @@ wheels/
 
 # Environment
 .env
+# Backups do .env (ex.: .env.bak.20261006-002337) — nunca versionar, têm segredos.
+.env.bak*
+.env.*.bak
 
 # Cache / dados / artefatos
 .pytest_cache/
