@@ -1,0 +1,38 @@
+# Override de PRODUÇÃO: faz o stack all-in-docker-gpu REUSAR os dados de produção
+# desta máquina, in-place, sem cópia. Use SEMPRE junto do compose base:
+#
+#   docker compose -f docker-compose.gpu.yml -f docker-compose.prod.yml up -d
+#
+# O que muda em relação ao base:
+#   - minio  -> usa o volume EXISTENTE evidencia_pipe_minio_data (externo)
+#   - qdrant -> bind no diretório EXISTENTE /app/minerU/qdrant_storage (42.853 pontos)
+#   - api    -> publica também em :8181 (porta que a produção no host usava)
+#
+# PRÉ-CONDIÇÕES (ver migrar-para-docker.md): os serviços legados que seguram esses
+# dados precisam estar PARADOS antes do `up` — senão dois processos abrem o mesmo
+# storage do Qdrant (lock) ou o mesmo volume do MinIO:
+#   - mineru_qdrant  (segura /app/minerU/qdrant_storage)  -> docker stop
+#   - evidencia_minio (segura evidencia_pipe_minio_data)   -> docker stop
+#   - host systemd (evidencia-api / -worker-light / -worker-gpu) -> systemctl disable --now
+#   - evidencia-compose.service -> systemctl disable --now (não ressubir os legados)
+
+services:
+  minio:
+    volumes: !override
+      - evidencia_pipe_minio_data:/data
+
+  qdrant:
+    volumes: !override
+      - /app/minerU/qdrant_storage:/qdrant/storage
+
+  api:
+    # Mantém o :8020 local do base e ADICIONA o :8181 (0.0.0.0) p/ consumidores
+    # externos que apontavam para a API do host. Restrinja a 127.0.0.1 se só local.
+    ports:
+      - "8181:8020"
+
+volumes:
+  # Reaponta o volume lógico `minio_data` do base para o volume de produção já
+  # existente (não cria um novo vazio).
+  evidencia_pipe_minio_data:
+    external: true
