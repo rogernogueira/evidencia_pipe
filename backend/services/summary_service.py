@@ -49,6 +49,7 @@ from backend.services.summary_prompts import (
     BASIC_SUMMARY_SYSTEM_PROMPT,
     OUTPUT_ONLY_REMINDER,
     build_basic_user_message,
+    focus_directive_for_roles,
 )
 
 # Diversidade documental: teto de chunks por documento nas evidências, evitando
@@ -523,7 +524,10 @@ class SummaryService:
                 retrieval=retrieval, summary="", mappings=[],
             )
 
-        user_message = build_basic_user_message(query, _evidence_block(evidences), language)
+        user_message = build_basic_user_message(
+            query, _evidence_block(evidences), language,
+            focus_directive_for_roles(roles),
+        )
         t0 = time.perf_counter()
         raw = await run_in_threadpool(_call_llm, BASIC_SUMMARY_SYSTEM_PROMPT, user_message)
         summary = _sanitize(raw, language=language, max_index=len(evidences))

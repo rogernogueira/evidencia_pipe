@@ -298,6 +298,45 @@ async def test_busca_global_tambem_filtra_por_achado(llm):
     assert [c["uuid"] for c in fake.chamadas] == [None]
 
 
+# --------------------------------------------------------------------------
+# Diretriz de foco no prompt (prompt-sistema é único; a direção vai na msg do user)
+# --------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_focus_achados_injeta_diretriz_de_achados(llm):
+    """Filtro por ['achado'] (o default) → a mensagem do LLM carrega a diretriz de ACHADOS,
+    e não a de recomendações."""
+    fake = _SemanticFake(globais=2)
+
+    await svc.SummaryService(fake).summarize("cobertura")
+
+    assert len(llm) == 1
+    assert "Foco desta síntese: ACHADOS" in llm[0]
+    assert "RECOMENDAÇÕES" not in llm[0]
+
+
+@pytest.mark.anyio
+async def test_focus_recomendacoes_injeta_diretriz_de_recomendacoes(llm):
+    fake = _SemanticFake(globais=2)
+
+    await svc.SummaryService(fake).summarize("cobertura", focus="recomendacoes")
+
+    assert len(llm) == 1
+    assert "Foco desta síntese: RECOMENDAÇÕES" in llm[0]
+    assert "registro propositivo" in llm[0]
+
+
+@pytest.mark.anyio
+async def test_focus_ambas_nao_injeta_diretriz(llm):
+    """Dois papéis (ambas): sem direção específica, para preservar o tom neutro."""
+    fake = _SemanticFake(globais=2)
+
+    await svc.SummaryService(fake).summarize("cobertura", focus="ambas")
+
+    assert len(llm) == 1
+    assert "Foco desta síntese" not in llm[0]
+
+
 @pytest.mark.anyio
 async def test_filtro_desligado_mantem_o_comportamento_original(llm, monkeypatch):
     """SUMMARY_ONLY_FINDINGS=false e sem focus → nenhuma consulta filtrada."""
